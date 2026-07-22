@@ -25,11 +25,12 @@ import sys
 import time
 
 from PySide6.QtCore import Qt, QTimer, Signal, QThread, QPointF, QMargins
-from PySide6.QtGui import QPainter, QColor, QFont, QBrush, QKeyEvent, QPalette, QPen
+from PySide6.QtGui import QPainter, QColor, QFont, QBrush, QKeyEvent, QPalette, QPen, QIcon, QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QPushButton, QComboBox, QSpinBox, QSlider,
-    QSizePolicy, QMessageBox, QInputDialog,
+    QSizePolicy, QMessageBox, QInputDialog, QCheckBox,
+    QSystemTrayIcon, QMenu,
 )
 from PySide6.QtCharts import QChart, QChartView, QLineSeries, QScatterSeries, QValueAxis
 
@@ -92,16 +93,62 @@ def apply_theme(app):
             border-radius:4px;
         }}
         QLabel {{ background:transparent; color:{C_LIGHT}; }}
+        QCheckBox {{ background:transparent; color:{C_LIGHT}; spacing:6px; }}
+        QCheckBox::indicator {{
+            width:15px; height:15px; border-radius:4px;
+            border:1px solid {C_BORDER}; background:{C_BG3};
+        }}
+        QCheckBox::indicator:hover {{ border-color:{C_ORANGE}; }}
+        QCheckBox::indicator:checked {{
+            background:{C_GREEN}; border-color:{C_GREEN};
+        }}
         QPushButton {{
             background:{C_BG3}; color:{C_LIGHT};
             border:1px solid {C_BORDER}; border-radius:5px;
-            padding:5px 11px;
+            padding:5px 11px; font-weight:600;
         }}
         QPushButton:hover {{
             background:{C_BORDER}; border-color:{C_ORANGE}; color:{C_WHITE};
         }}
         QPushButton:pressed {{ background:{C_VDGREY}; }}
-        QPushButton:disabled {{ color:{C_VDGREY}; border-color:{C_BG3}; }}
+        QPushButton:disabled {{
+            background:{C_BG}; color:{C_VDGREY}; border-color:{C_BG3};
+        }}
+
+        /* Primary actions — read / save / select (cyan) */
+        QPushButton#btnPrimary {{
+            border-color:{C_CYAN}; color:{C_CYAN};
+        }}
+        QPushButton#btnPrimary:hover {{
+            background:{C_CYAN}; color:{C_BG}; border-color:{C_CYAN};
+        }}
+
+        /* Apply — the main commit action (green, filled) */
+        QPushButton#btnApply {{
+            background:{C_GREEN}; color:{C_BG};
+            border:1px solid {C_GREEN}; font-weight:700;
+        }}
+        QPushButton#btnApply:hover {{
+            background:{C_LIGHT}; border-color:{C_GREEN}; color:{C_BG};
+        }}
+        QPushButton#btnApply:pressed {{ background:{C_GREEN}; }}
+
+        /* Accent — default / lock (yellow-orange) */
+        QPushButton#btnAccent {{
+            border-color:{C_YELLOW}; color:{C_YELLOW};
+        }}
+        QPushButton#btnAccent:hover {{
+            background:{C_YELLOW}; color:{C_BG}; border-color:{C_YELLOW};
+        }}
+
+        /* Destructive — delete / reset / unlock (red) */
+        QPushButton#btnDanger {{
+            border-color:{C_STOP}; color:{C_STOP};
+        }}
+        QPushButton#btnDanger:hover {{
+            background:{C_STOP}; color:{C_BG}; border-color:{C_STOP};
+        }}
+
         QComboBox, QSpinBox, QLineEdit {{
             background:{C_BG3}; color:{C_LIGHT};
             border:1px solid {C_BORDER}; border-radius:5px;
@@ -112,19 +159,28 @@ def apply_theme(app):
             border-color:{C_ORANGE};
         }}
         QComboBox:focus, QSpinBox:focus, QLineEdit:focus {{
-            border-color:{C_YELLOW};
+            border-color:{C_YELLOW}; background:{C_BG};
         }}
         QComboBox::drop-down {{ border:0; width:18px; }}
+        QComboBox::down-arrow {{ width:0; height:0; }}
         QComboBox QAbstractItemView {{
             background:{C_BG3}; color:{C_LIGHT};
             selection-background-color:{C_ORANGE}; selection-color:{C_BG};
-            border:1px solid {C_BORDER};
+            border:1px solid {C_BORDER}; outline:0;
         }}
         QSpinBox::up-button, QSpinBox::down-button {{
-            background:{C_BORDER}; border:0; width:14px;
+            background:{C_BORDER}; border:0; width:15px;
         }}
         QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
             background:{C_ORANGE};
+        }}
+        QSpinBox::up-arrow {{
+            width:0; height:0; border-left:4px solid transparent;
+            border-right:4px solid transparent; border-bottom:5px solid {C_LIGHT};
+        }}
+        QSpinBox::down-arrow {{
+            width:0; height:0; border-left:4px solid transparent;
+            border-right:4px solid transparent; border-top:5px solid {C_LIGHT};
         }}
         QSlider::groove:horizontal {{
             height:5px; background:{C_BG3}; border:1px solid {C_BORDER};
@@ -154,6 +210,25 @@ ROOT_HELPER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "roo
 NVCURVE_PROFILES_DIR = "/etc/nvcurve/profiles"
 NVCURVE_CONFIG_PATH = "/etc/nvcurve/config.json"
 RUN_DIR = "/run/nvcurve-gui"
+
+# Internal scratch profile used by "Apply Offsets" to persist+apply the
+# live-edited graph without polluting the user's named-profile list.
+# (Replaces the old hardcoded "ppm" name.) It is hidden from the profile
+# combo and the tray menu.
+SCRATCH_PROFILE = "_live"
+
+# Freedesktop autostart entry — when enabled, the app relaunches on login
+# (with --tray so it starts hidden in the tray and auto-applies the
+# default profile).
+AUTOSTART_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "autostart",
+)
+AUTOSTART_FILE = os.path.join(AUTOSTART_DIR, "nvcurve-gui.desktop")
+
+# Minimum gap between tray-triggered profile applies, to stop rapid-fire
+# clicking from queueing many privileged operations back to back.
+TRAY_APPLY_COOLDOWN_MS = 3000
 
 
 def SL(text, color=C_LIGHT, bold=False, size=9):
@@ -528,6 +603,10 @@ class NVCurveWindow(QMainWindow):
         self._read_core_offset = 0
         self._busy = False
         self._workers = []  # keep references so QThreads aren't GC'd mid-flight
+        self._tray_cooldown = False  # rate-limits tray-triggered applies
+        self._force_quit = False     # True when quitting via tray menu, not the X
+        self.tray_icon = None
+        self.tray_menu = None
 
         self.nvml_available = False
         self.nvml_handle = None
@@ -543,6 +622,9 @@ class NVCurveWindow(QMainWindow):
 
         QTimer.singleShot(0, self._nvml_init_async)
 
+        # System tray icon (close-to-tray + quick profile apply menu).
+        self._setup_tray()
+
         # Auto-read the current V/F curve once on startup so the graph
         # reflects real hardware state immediately instead of the
         # placeholder default_points. Deferred with singleShot so the
@@ -550,6 +632,11 @@ class NVCurveWindow(QMainWindow):
         # then appears over an already-visible window rather than before
         # anything is drawn.
         QTimer.singleShot(0, self._read_gpu_curve)
+
+        # When launched with --tray (autostart on login), apply the default
+        # profile once and stay hidden in the tray.
+        if "--tray" in sys.argv:
+            QTimer.singleShot(400, self._autoload_default_profile)
 
     # ─── Logging ─────────────────────────────────────────────────────
     def _log(self, text):
@@ -576,6 +663,7 @@ class NVCurveWindow(QMainWindow):
         info_layout.addStretch()
 
         self.btn_save_profile = QPushButton("💾 Save As")
+        self.btn_save_profile.setObjectName("btnPrimary")
         self.btn_save_profile.setFixedHeight(24)
         self.btn_save_profile.setFixedWidth(90)
         self.btn_save_profile.clicked.connect(self._save_profile_as)
@@ -590,13 +678,23 @@ class NVCurveWindow(QMainWindow):
 
         # Profile toolbar
         profile_toolbar = QHBoxLayout()
+        self.chk_autostart = QCheckBox("Autostart in tray")
+        self.chk_autostart.setToolTip(
+            "Launch nvcurve-gui automatically on login, start minimized to the\n"
+            "system tray, and apply the default profile (if one is set)."
+        )
+        self.chk_autostart.setChecked(os.path.isfile(AUTOSTART_FILE))
+        self.chk_autostart.toggled.connect(self._on_autostart_toggled)
+        profile_toolbar.addWidget(self.chk_autostart)
         profile_toolbar.addStretch()
         self.btn_set_default_profile = QPushButton("⭐ Default")
+        self.btn_set_default_profile.setObjectName("btnAccent")
         self.btn_set_default_profile.setFixedHeight(24)
         self.btn_set_default_profile.setFixedWidth(100)
         self.btn_set_default_profile.clicked.connect(self._toggle_default_gpu_profile)
         profile_toolbar.addWidget(self.btn_set_default_profile)
         self.btn_delete_profile = QPushButton("🗑 Delete")
+        self.btn_delete_profile.setObjectName("btnDanger")
         self.btn_delete_profile.setFixedHeight(24)
         self.btn_delete_profile.setFixedWidth(100)
         self.btn_delete_profile.clicked.connect(self._delete_gpu_profile)
@@ -622,13 +720,17 @@ class NVCurveWindow(QMainWindow):
         self.point_offset_spin.setEnabled(False)
 
         for lbl in (self.point_index_label, self.point_voltage_label,
-                    self.point_freq_label, self.point_offset_label):
+                    self.point_freq_label):
             lbl.setFixedWidth(100)
+        # "Total Offset: -1234 MHz" is longer than the other readouts, so give
+        # it more room; a fixed 100px clipped it under the spin box.
+        self.point_offset_label.setMinimumWidth(150)
 
         info_panel_layout.addWidget(self.point_index_label)
         info_panel_layout.addWidget(self.point_voltage_label)
         info_panel_layout.addWidget(self.point_freq_label)
         info_panel_layout.addWidget(self.point_offset_label)
+        info_panel_layout.addSpacing(8)
         info_panel_layout.addWidget(self.point_offset_spin)
 
         limit_label = SL("Flatten After Index:", color=C_GREY)
@@ -658,10 +760,12 @@ class NVCurveWindow(QMainWindow):
         bottom_buttons_layout = QHBoxLayout()
         bottom_buttons_layout.addStretch()
         self.btn_select_all = QPushButton("✅ Select All")
+        self.btn_select_all.setObjectName("btnPrimary")
         self.btn_select_all.setFixedHeight(24)
         self.btn_select_all.clicked.connect(self.vf_widget.select_all)
         bottom_buttons_layout.addWidget(self.btn_select_all)
         self.btn_reset_graph = QPushButton("↺ Reset Graph")
+        self.btn_reset_graph.setObjectName("btnDanger")
         self.btn_reset_graph.setFixedHeight(24)
         self.btn_reset_graph.clicked.connect(self._reset_graph_to_last_read)
         bottom_buttons_layout.addWidget(self.btn_reset_graph)
@@ -718,12 +822,14 @@ class NVCurveWindow(QMainWindow):
         control_layout.addWidget(self.vram_lock_max_spin)
 
         self.btn_vram_lock = QPushButton("🔒")
+        self.btn_vram_lock.setObjectName("btnAccent")
         self.btn_vram_lock.setFixedHeight(24)
         self.btn_vram_lock.setFixedWidth(34)
         self.btn_vram_lock.setToolTip("Lock VRAM clock to Min–Max now")
         self.btn_vram_lock.clicked.connect(self._apply_vram_memlock)
         control_layout.addWidget(self.btn_vram_lock)
         self.btn_vram_unlock = QPushButton("🔓")
+        self.btn_vram_unlock.setObjectName("btnDanger")
         self.btn_vram_unlock.setFixedHeight(24)
         self.btn_vram_unlock.setFixedWidth(34)
         self.btn_vram_unlock.setToolTip("Unlock VRAM clock")
@@ -733,14 +839,17 @@ class NVCurveWindow(QMainWindow):
         control_layout.addStretch()
 
         self.btn_read_curve = QPushButton("📥 Read Current Curve")
+        self.btn_read_curve.setObjectName("btnPrimary")
         self.btn_read_curve.setFixedHeight(24)
         self.btn_read_curve.clicked.connect(self._read_gpu_curve)
         control_layout.addWidget(self.btn_read_curve)
         self.btn_apply_offset = QPushButton("🚀 Apply Offsets")
+        self.btn_apply_offset.setObjectName("btnApply")
         self.btn_apply_offset.setFixedHeight(24)
         self.btn_apply_offset.clicked.connect(self._apply_gpu_offsets)
         control_layout.addWidget(self.btn_apply_offset)
         self.btn_reset_curve = QPushButton("↺ Reset Curve")
+        self.btn_reset_curve.setObjectName("btnDanger")
         self.btn_reset_curve.setFixedHeight(24)
         self.btn_reset_curve.clicked.connect(self._reset_gpu_curve)
         control_layout.addWidget(self.btn_reset_curve)
@@ -760,8 +869,17 @@ class NVCurveWindow(QMainWindow):
 
     # ─── Generic root_helper runner ──────────────────────────────────
     def _run_root_helper_command(self, payload_dict, success_msg, fail_msg, callback=None, quiet_success=False):
+        if self._busy:
+            self._log("⏳ Another operation is still running — please wait.")
+            return
+        self._busy = True
+        self._set_busy_ui(True)
         worker = RootHelperWorker(payload_dict, parent=self)
         self._workers.append(worker)
+
+        def _finish():
+            self._busy = False
+            self._set_busy_ui(False)
 
         def on_ok(res):
             if not quiet_success:
@@ -773,16 +891,29 @@ class NVCurveWindow(QMainWindow):
             if callback:
                 callback(res)
             self._workers.remove(worker)
+            _finish()
 
         def on_err(err):
             self._log(f"✘ {fail_msg}: {err}")
             if callback:
                 callback(None)
             self._workers.remove(worker)
+            _finish()
 
         worker.finished_ok.connect(on_ok)
         worker.finished_err.connect(on_err)
         worker.start()
+
+    def _set_busy_ui(self, busy):
+        """Disable the privileged action buttons while an op is in flight."""
+        for attr in ("btn_apply_offset", "btn_read_curve", "btn_reset_curve",
+                     "btn_vram_lock", "btn_vram_unlock", "btn_save_profile",
+                     "btn_set_default_profile", "btn_delete_profile"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                w.setEnabled(not busy)
+        if hasattr(self, "tray_menu") and self.tray_menu is not None:
+            self.tray_menu.setEnabled(not busy)
 
     # ─── Curve display recompute ─────────────────────────────────────
     def _recompute_display(self):
@@ -1025,6 +1156,8 @@ class NVCurveWindow(QMainWindow):
                 self.profile_combo.blockSignals(False)
                 return
             files = [f for f in os.listdir(NVCURVE_PROFILES_DIR) if f.endswith('.json')]
+            # Hide the internal scratch profile used by "Apply Offsets".
+            files = [f for f in files if f != f"{SCRATCH_PROFILE}.json"]
             files.sort()
             default_name = self._read_default_gpu_profile_name()
             self.profile_combo.blockSignals(True)
@@ -1036,6 +1169,8 @@ class NVCurveWindow(QMainWindow):
             if self.profile_combo.count() > 0:
                 self.profile_combo.setCurrentIndex(0)
             self.profile_combo.blockSignals(False)
+            if getattr(self, "tray_menu", None) is not None:
+                self._rebuild_tray_menu()
         except Exception as e:
             self._log(f"⚠️ Could not read the profile list: {e}")
 
@@ -1142,6 +1277,8 @@ class NVCurveWindow(QMainWindow):
         self.profile_combo.setCurrentIndex(current_idx)
         self.profile_combo.blockSignals(False)
         self.profile_combo.update()
+        if getattr(self, "tray_menu", None) is not None:
+            self._rebuild_tray_menu()
         self._log(f"ℹ️ Default GPU profile is now: {default_name or '(none)'}")
 
     def _toggle_default_gpu_profile(self):
@@ -1203,7 +1340,7 @@ class NVCurveWindow(QMainWindow):
         )
 
     def _apply_gpu_offsets(self):
-        profile_name = "ppm"
+        profile_name = SCRATCH_PROFILE
         if not self._default_points:
             self._log("❌ No curve loaded yet — read the current curve or load a profile first.")
             return
@@ -1543,12 +1680,208 @@ class NVCurveWindow(QMainWindow):
             self.nvml_available = False
             self._log(f"⚠️ NVML not available: {err} (falling back to nvidia-smi)")
 
+    # ─── System tray ─────────────────────────────────────────────────
+    def _make_tray_icon(self):
+        """Build a themed tray icon: a small rising V/F curve on a dark
+        rounded tile, drawn at runtime so no external asset is needed."""
+        from PySide6.QtGui import QPixmap, QPainterPath
+        from PySide6.QtCore import QRectF
+        px = QPixmap(64, 64)
+        px.fill(QColor(0, 0, 0, 0))
+        p = QPainter(px)
+        p.setRenderHint(QPainter.Antialiasing)
+        # rounded background tile
+        p.setBrush(QColor(C_BG3))
+        p.setPen(QPen(QColor(C_BORDER), 2))
+        p.drawRoundedRect(QRectF(3, 3, 58, 58), 12, 12)
+        # rising curve
+        path = QPainterPath()
+        path.moveTo(14, 48)
+        path.cubicTo(28, 46, 34, 26, 50, 16)
+        pen = QPen(QColor(C_ORANGE), 5)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+        # a couple of node dots
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(C_YELLOW))
+        p.drawEllipse(QPointF(50, 16), 4, 4)
+        p.setBrush(QColor(C_CYAN))
+        p.drawEllipse(QPointF(14, 48), 3.5, 3.5)
+        p.end()
+        return QIcon(px)
+
+    def _setup_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._log("ℹ️ System tray not available; close-to-tray disabled.")
+            return
+        icon = self._make_tray_icon()
+        self.setWindowIcon(icon)
+        self.tray_icon = QSystemTrayIcon(icon, self)
+        self.tray_icon.setToolTip("nvcurve-gui — GPU V/F Curve Tuning")
+        self.tray_menu = QMenu()
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self._rebuild_tray_menu()
+        self.tray_icon.show()
+
+    def _rebuild_tray_menu(self):
+        """(Re)populate the tray right-click menu with the saved profiles."""
+        if self.tray_menu is None:
+            return
+        self.tray_menu.clear()
+
+        header = self.tray_menu.addAction("Apply profile:")
+        header.setEnabled(False)
+
+        default_name = self._read_default_gpu_profile_name()
+        added = 0
+        try:
+            files = sorted(
+                f[:-5] for f in os.listdir(NVCURVE_PROFILES_DIR)
+                if f.endswith(".json") and f != f"{SCRATCH_PROFILE}.json"
+            )
+        except OSError:
+            files = []
+        for name in files:
+            label = f"{name}  ★" if name == default_name else name
+            act = self.tray_menu.addAction(label)
+            act.triggered.connect(lambda _checked=False, n=name: self._tray_apply_profile(n))
+            added += 1
+        if added == 0:
+            none_act = self.tray_menu.addAction("(no saved profiles)")
+            none_act.setEnabled(False)
+
+        self.tray_menu.addSeparator()
+        show_act = self.tray_menu.addAction("Show window")
+        show_act.triggered.connect(self._restore_from_tray)
+        quit_act = self.tray_menu.addAction("Quit")
+        quit_act.triggered.connect(self._quit_from_tray)
+
+    def _on_tray_activated(self, reason):
+        # Left-click / double-click toggles the window; right-click shows menu.
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            if self.isVisible():
+                self.hide()
+            else:
+                self._restore_from_tray()
+
+    def _restore_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self):
+        self._force_quit = True
+        self.close()
+
+    def _tray_apply_profile(self, name):
+        """Apply a saved profile from the tray, with a busy + cooldown guard
+        so rapid clicks don't queue up multiple privileged applies."""
+        if self._busy or self._tray_cooldown:
+            if self.tray_icon:
+                self.tray_icon.showMessage(
+                    "nvcurve-gui", "Please wait — still applying the previous change.",
+                    self._make_tray_icon(), 2000,
+                )
+            return
+        profile_path = os.path.join(NVCURVE_PROFILES_DIR, f"{name}.json")
+        if not os.path.isfile(profile_path):
+            self._log(f"❌ Profile not found: {name}")
+            return
+
+        # start cooldown window
+        self._tray_cooldown = True
+        QTimer.singleShot(TRAY_APPLY_COOLDOWN_MS, self._clear_tray_cooldown)
+
+        self._log(f"🔻 Tray: applying profile '{name}'…")
+        payload = {"op": "apply_named_profile", "name": name}
+        self._run_root_helper_command(
+            payload,
+            f"Profile '{name}' applied.",
+            f"Failed to apply profile '{name}'.",
+            callback=self._after_apply_read,
+        )
+        if self.tray_icon:
+            self.tray_icon.showMessage(
+                "nvcurve-gui", f"Applying '{name}'…", self._make_tray_icon(), 1500,
+            )
+
+    def _clear_tray_cooldown(self):
+        self._tray_cooldown = False
+
+    def _autoload_default_profile(self):
+        """Apply whatever profile is marked default (used on --tray startup)."""
+        default_name = self._read_default_gpu_profile_name()
+        if not default_name:
+            self._log("ℹ️ Autostart: no default profile set — nothing to apply.")
+            return
+        self._log(f"⚙️ Autostart: applying default profile '{default_name}'…")
+        self._run_root_helper_command(
+            {"op": "run_gpu_autoload"},
+            f"Default profile '{default_name}' applied on startup.",
+            "Autostart apply failed.",
+            callback=self._after_apply_read,
+        )
+
+    # ─── Autostart (.desktop in ~/.config/autostart) ─────────────────
+    def _on_autostart_toggled(self, checked):
+        try:
+            if checked:
+                self._write_autostart_entry()
+                self._log("✅ Autostart enabled (launches in tray on login).")
+            else:
+                if os.path.isfile(AUTOSTART_FILE):
+                    os.remove(AUTOSTART_FILE)
+                self._log("➖ Autostart disabled.")
+        except OSError as e:
+            self._log(f"⚠️ Could not update autostart: {e}")
+            # revert the checkbox to reflect real state
+            self.chk_autostart.blockSignals(True)
+            self.chk_autostart.setChecked(os.path.isfile(AUTOSTART_FILE))
+            self.chk_autostart.blockSignals(False)
+
+    def _write_autostart_entry(self):
+        os.makedirs(AUTOSTART_DIR, exist_ok=True)
+        # Prefer the installed launcher; fall back to running this file.
+        launcher = "/usr/local/bin/nvcurve-gui"
+        if os.path.exists(launcher):
+            exec_cmd = f"{launcher} --tray"
+        else:
+            script = os.path.abspath(__file__)
+            exec_cmd = f"{sys.executable} {script} --tray"
+        content = (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=nvcurve-gui\n"
+            "Comment=Apply default GPU V/F curve profile and sit in the tray\n"
+            f"Exec={exec_cmd}\n"
+            "Terminal=false\n"
+            "X-GNOME-Autostart-enabled=true\n"
+        )
+        with open(AUTOSTART_FILE, "w", encoding="utf-8") as f:
+            f.write(content)
+
     def closeEvent(self, event):
+        # Close-to-tray: the X button hides to the tray instead of quitting,
+        # unless the user chose Quit from the tray menu (or there's no tray).
+        if not self._force_quit and self.tray_icon is not None and self.tray_icon.isVisible():
+            event.ignore()
+            self.hide()
+            self.tray_icon.showMessage(
+                "nvcurve-gui",
+                "Still running in the tray — right-click the icon for profiles.",
+                self._make_tray_icon(), 2500,
+            )
+            return
         try:
             if self.nvml_available and self._nvml is not None:
                 self._nvml.nvmlShutdown()
         except Exception:
             pass
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
         super().closeEvent(event)
 
 
@@ -1556,8 +1889,17 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("nvcurve-gui")
     apply_theme(app)
+    # Hiding the window to the tray must not quit the app.
+    app.setQuitOnLastWindowClosed(False)
     win = NVCurveWindow()
-    win.show()
+    if win.tray_icon is not None:
+        app.setWindowIcon(win.windowIcon())
+    # --tray (autostart on login): start hidden in the tray. If the tray
+    # isn't available, fall back to showing the window normally.
+    if "--tray" in sys.argv and win.tray_icon is not None:
+        pass  # stay hidden; tray icon is already visible
+    else:
+        win.show()
     sys.exit(app.exec())
 
 

@@ -180,6 +180,42 @@ def op_apply_gpu_offsets(params: dict) -> dict:
     return {"ok": True, "message": message}
 
 
+def op_apply_named_profile(params: dict) -> dict:
+    """Apply an already-saved profile by name (no writing of new JSON).
+    Used by the tray quick-apply menu and the profile combo."""
+    name = params.get("name")
+    if not isinstance(name, str) or not PROFILE_NAME_RE.match(name):
+        return {"ok": False, "error": "Invalid profile name"}
+
+    profile_path = os.path.join(NVCURVE_PROFILES_DIR, f"{name}.json")
+    if os.path.dirname(os.path.abspath(profile_path)) != os.path.abspath(NVCURVE_PROFILES_DIR):
+        return {"ok": False, "error": "Path traversal detected"}
+    if not os.path.isfile(profile_path):
+        return {"ok": False, "error": f"Profile not found: {name}"}
+
+    # Reset first so the profile applies cleanly on top of a known baseline.
+    reset_result = _run_nvcurve("write", "--range", "0-132", "--delta", "0")
+    if reset_result.returncode != 0:
+        return {"ok": False, "error": f"Reset failed: {reset_result.stderr.strip()}"}
+
+    result = _run_nvcurve("profile", "apply", name)
+    if result.returncode != 0:
+        return {"ok": False, "error": result.stderr.strip() if result.stderr else "Apply failed"}
+
+    result2 = _run_nvcurve("read", "--json")
+    if result2.returncode == 0:
+        try:
+            data = json.loads(result2.stdout)
+            _atomic_write_run_json(GPU_APPLY_RESULT, data)
+        except Exception:
+            pass
+
+    message = f"Profile '{name}' applied successfully."
+    if result.stderr and result.stderr.strip():
+        message += "\n" + result.stderr.strip()
+    return {"ok": True, "message": message}
+
+
 def op_reset_gpu_curve(params: dict) -> dict:
     reset_proc = _run_nvcurve("write", "--range", "0-132", "--delta", "0")
     if reset_proc.returncode != 0:
@@ -332,6 +368,7 @@ def op_run_gpu_autoload(params: dict) -> dict:
 OPERATIONS = {
     "read_gpu_curve": op_read_gpu_curve,
     "apply_gpu_offsets": op_apply_gpu_offsets,
+    "apply_named_profile": op_apply_named_profile,
     "reset_gpu_curve": op_reset_gpu_curve,
     "set_vram_memlock": op_set_vram_memlock,
     "reset_vram_memlock": op_reset_vram_memlock,

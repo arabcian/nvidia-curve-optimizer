@@ -1,5 +1,40 @@
 # nvcurve-gui
 
+> ## ⚠️ Disclaimer — read before using
+>
+> This tool works by calling **undocumented, private NVIDIA NvAPI
+> functions** (`GetVFPCurve`, `SetClockBoostTable`, and related calls
+> reverse-engineered from the closed-source Windows NvAPI headers —
+> there is no public, supported API for reading or writing a GPU's
+> voltage/frequency curve on Linux). These functions have no official
+> specification, are not covered by any NVIDIA support channel, and can
+> change behavior, change layout, or disappear entirely in any future
+> driver release without notice.
+>
+> Concretely, this means:
+> - There is **no guarantee of correctness**. The offsets, voltage
+>   points, and clock domains this tool reads and writes are inferred
+>   from reverse-engineering, not from documentation NVIDIA has
+>   published.
+> - **Overclocking/undervolting always carries risk**: instability,
+>   crashes, driver resets, artifacts, data loss from an unexpected
+>   crash, and — in rare or sustained-abuse cases — hardware damage or
+>   reduced hardware lifespan are all possible outcomes of GPU
+>   frequency/voltage/power tuning in general, independent of this
+>   specific tool.
+> - This project, its authors, and Anthropic (which assisted in
+>   preparing this codebase) provide it **as-is, with no warranty of
+>   any kind**, and accept **no responsibility or liability** for any
+>   damage, data loss, instability, or hardware failure resulting from
+>   its use.
+> - **You are solely responsible** for what you do with this tool,
+>   including deciding whether to use it at all, validating any curve
+>   before applying it, and monitoring your hardware (temperatures,
+>   stability) while doing so. If you are not comfortable accepting
+>   that risk, do not use this software.
+>
+> Use at your own risk.
+
 Standalone PySide6 GUI for the `nvcurve` NVIDIA V/F-curve CLI/HAL
 package. This is the GPU-tuning tab of `m16R1-power-manager`, extracted
 into its own single-purpose application — **no cTGP/nvctgp, no gaming

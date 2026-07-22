@@ -1,5 +1,12 @@
 # nvcurve-gui — Usage Guide
 
+> **Before you start:** this tool relies on undocumented NVIDIA NvAPI
+> functions and lets you change your GPU's voltage/frequency curve and
+> power-related clocks. That carries real risk (instability, crashes,
+> in rare cases hardware damage) and comes with no warranty from
+> NVIDIA, this project, or Anthropic. See the disclaimer at the top of
+> `README.md` before using it. You are responsible for what you apply.
+
 This guide covers day-to-day use of the app after it's installed. For
 architecture/internals, see `README.md`.
 

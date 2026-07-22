@@ -87,8 +87,29 @@ def _atomic_write_run_json(target_path: str, data) -> None:
 
 
 def _nvcurve_env():
-    env = os.environ.copy()
-    env["PYTHONPATH"] = NVCURVE_PROJECT_DIR + os.pathsep + env.get("PYTHONPATH", "")
+    """Builds a minimal, explicit environment for the nvcurve subprocess
+    instead of inheriting whatever pkexec passed through to us.
+
+    SECURITY (defense in depth): pkexec already strips almost everything
+    from the invoking user's environment before it runs us as root, but
+    this process shouldn't rely on that alone. We build our own
+    allowlist here so that even a pkexec/polkit misconfiguration, or a
+    future change to what it forwards, can't smuggle something like
+    LD_PRELOAD, PYTHONSTARTUP, or a stray pre-existing PYTHONPATH entry
+    into a subprocess we spawn as root. Only PATH (needed to find
+    `python3` itself and anything it shells out to) and a couple of
+    harmless locale/display vars are kept; everything else is dropped
+    and rebuilt from scratch.
+    """
+    safe_keys = ("PATH", "LANG", "LC_ALL")
+    env = {k: os.environ[k] for k in safe_keys if k in os.environ}
+    env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    # Our own install dir only — never anything derived from the caller.
+    env["PYTHONPATH"] = NVCURVE_PROJECT_DIR
+    # Never let a caller-controlled PYTHONSTARTUP/PYTHONNOUSERSITE/etc.
+    # ride along even if it somehow ended up in os.environ.
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONNOUSERSITE"] = "1"
     return env
 
 

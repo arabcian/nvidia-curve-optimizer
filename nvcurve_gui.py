@@ -1289,6 +1289,10 @@ class NVCurveWindow(QMainWindow):
             self._log(f"❌ Error processing apply result: {e}")
         finally:
             self._reset_graph_to_last_read()
+        try:
+            os.remove(json_path)
+        except Exception:
+            pass
 
     def _after_reset_read(self, res):
         self.btn_reset_curve.setEnabled(True)
@@ -1331,6 +1335,10 @@ class NVCurveWindow(QMainWindow):
             self._log(f"❌ Error processing reset result: {e}")
         finally:
             self._update_core_offset_ui()
+        try:
+            os.remove(json_path)
+        except Exception:
+            pass
 
     # ─── GPU info polling ─────────────────────────────────────────────
     def _update_gpu_info(self):

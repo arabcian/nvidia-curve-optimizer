@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<policyconfig>
+
+  <!--
+    nvcurve-gui — Polkit Action
+
+    Pins pkexec's invocation of /usr/local/lib/nvcurve-gui/root_helper.py
+    to this action instead of the default org.freedesktop.policykit.exec
+    (which would prompt for a password on every single call with no
+    caching). allow_active is "auth_admin_keep" — a short-lived cache,
+    typically a few minutes per polkit's own configuration.
+
+    For fully passwordless operation (opt-in), see the accompanying
+    49-nvcurve-gui.rules file installed under /etc/polkit-1/rules.d —
+    the <defaults> block below is only the safe fallback if that rule
+    isn't active for any reason.
+
+    root_helper.py is root:root, mode 0700, so a non-root user cannot
+    modify its contents — this is what makes trusting this action safe.
+  -->
+
+  <action id="com.nvcurve.gui.set-params">
+    <description>Apply NVIDIA GPU V/F curve settings via the nvcurve-gui root helper</description>
+    <message>Administrator authentication required (nvcurve-gui)</message>
+
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+
+    <!--
+      CRITICAL: without this annotation, this action is never triggered —
+      pkexec falls back to the default org.freedesktop.policykit.exec
+      action and asks for a password every time. This annotation is what
+      binds the PROGRAM pkexec runs to this action.
+    -->
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/lib/nvcurve-gui/root_helper.py</annotate>
+  </action>
+
+</policyconfig>

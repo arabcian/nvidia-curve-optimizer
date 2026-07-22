@@ -24,8 +24,8 @@ import subprocess
 import sys
 import time
 
-from PySide6.QtCore import Qt, QTimer, Signal, QThread, QPointF
-from PySide6.QtGui import QPainter, QColor, QFont, QBrush, QKeyEvent
+from PySide6.QtCore import Qt, QTimer, Signal, QThread, QPointF, QMargins
+from PySide6.QtGui import QPainter, QColor, QFont, QBrush, QKeyEvent, QPalette, QPen
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QPushButton, QComboBox, QSpinBox, QSlider,
@@ -34,18 +34,121 @@ from PySide6.QtWidgets import (
 from PySide6.QtCharts import QChart, QChartView, QLineSeries, QScatterSeries, QValueAxis
 
 # ─── Theme ───────────────────────────────────────────────────────────────
-C_BG = "#1d2021"
-C_BG3 = "#3c3836"
-C_BORDER = "#504945"
-C_VDGREY = "#665c54"
-C_GREY = "#a89984"
-C_LIGHT = "#ebdbb2"
-C_WHITE = "#fbf1c7"
-C_CYAN = "#83a598"
-C_ORANGE = "#fe8019"
-C_YELLOW = "#fabd2f"
-C_GREEN = "#b8bb26"
-C_STOP = "#fb4934"
+C_BG = "#2b2420"
+C_BG3 = "#3d332c"
+C_BORDER = "#5a4c3f"
+C_VDGREY = "#7a6a58"
+C_GREY = "#bfae98"
+C_LIGHT = "#f0e6d2"
+C_WHITE = "#faf3e3"
+C_CYAN = "#a4ccbc"
+C_ORANGE = "#ddae88"
+C_YELLOW = "#e3cfa0"
+C_GREEN = "#cbcd84"
+C_STOP = "#db9b94"
+
+def apply_theme(app):
+    """Force the warm Gruvbox theme app-wide.
+
+    A window-level setStyleSheet("background:..;color:..") does NOT cascade
+    to child widgets driven by the OS/KDE palette (labels, group boxes,
+    tabs, buttons, spin boxes, the chart) — that is why most of the UI
+    stayed monochrome. Setting a full QPalette plus a scoped QSS on the
+    QApplication themes every widget from one place.
+    """
+    app.setStyle("Fusion")
+
+    pal = QPalette()
+    pal.setColor(QPalette.Window, QColor(C_BG))
+    pal.setColor(QPalette.WindowText, QColor(C_LIGHT))
+    pal.setColor(QPalette.Base, QColor(C_BG3))
+    pal.setColor(QPalette.AlternateBase, QColor(C_BORDER))
+    pal.setColor(QPalette.ToolTipBase, QColor(C_BG3))
+    pal.setColor(QPalette.ToolTipText, QColor(C_LIGHT))
+    pal.setColor(QPalette.Text, QColor(C_LIGHT))
+    pal.setColor(QPalette.Button, QColor(C_BG3))
+    pal.setColor(QPalette.ButtonText, QColor(C_LIGHT))
+    pal.setColor(QPalette.BrightText, QColor(C_STOP))
+    pal.setColor(QPalette.Link, QColor(C_CYAN))
+    pal.setColor(QPalette.Highlight, QColor(C_ORANGE))
+    pal.setColor(QPalette.HighlightedText, QColor(C_BG))
+    pal.setColor(QPalette.PlaceholderText, QColor(C_GREY))
+    dis = QPalette.Disabled
+    pal.setColor(dis, QPalette.WindowText, QColor(C_VDGREY))
+    pal.setColor(dis, QPalette.Text, QColor(C_VDGREY))
+    pal.setColor(dis, QPalette.ButtonText, QColor(C_VDGREY))
+    app.setPalette(pal)
+
+    app.setStyleSheet(f"""
+        QWidget {{ background:{C_BG}; color:{C_LIGHT}; }}
+        QGroupBox {{
+            border:1px solid {C_BORDER}; border-radius:6px;
+            margin-top:9px; padding-top:9px; background:{C_BG};
+        }}
+        QGroupBox::title {{
+            subcontrol-origin:margin; subcontrol-position:top left;
+            left:8px; padding:1px 6px; color:{C_ORANGE}; font-weight:bold;
+            background:{C_BG3}; border:1px solid {C_BORDER};
+            border-radius:4px;
+        }}
+        QLabel {{ background:transparent; color:{C_LIGHT}; }}
+        QPushButton {{
+            background:{C_BG3}; color:{C_LIGHT};
+            border:1px solid {C_BORDER}; border-radius:5px;
+            padding:5px 11px;
+        }}
+        QPushButton:hover {{
+            background:{C_BORDER}; border-color:{C_ORANGE}; color:{C_WHITE};
+        }}
+        QPushButton:pressed {{ background:{C_VDGREY}; }}
+        QPushButton:disabled {{ color:{C_VDGREY}; border-color:{C_BG3}; }}
+        QComboBox, QSpinBox, QLineEdit {{
+            background:{C_BG3}; color:{C_LIGHT};
+            border:1px solid {C_BORDER}; border-radius:5px;
+            padding:3px 5px; selection-background-color:{C_ORANGE};
+            selection-color:{C_BG};
+        }}
+        QComboBox:hover, QSpinBox:hover, QLineEdit:hover {{
+            border-color:{C_ORANGE};
+        }}
+        QComboBox:focus, QSpinBox:focus, QLineEdit:focus {{
+            border-color:{C_YELLOW};
+        }}
+        QComboBox::drop-down {{ border:0; width:18px; }}
+        QComboBox QAbstractItemView {{
+            background:{C_BG3}; color:{C_LIGHT};
+            selection-background-color:{C_ORANGE}; selection-color:{C_BG};
+            border:1px solid {C_BORDER};
+        }}
+        QSpinBox::up-button, QSpinBox::down-button {{
+            background:{C_BORDER}; border:0; width:14px;
+        }}
+        QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
+            background:{C_ORANGE};
+        }}
+        QSlider::groove:horizontal {{
+            height:5px; background:{C_BG3}; border:1px solid {C_BORDER};
+            border-radius:3px;
+        }}
+        QSlider::sub-page:horizontal {{
+            background:{C_ORANGE}; border-radius:3px;
+        }}
+        QSlider::handle:horizontal {{
+            background:{C_YELLOW}; width:14px; margin:-6px 0;
+            border-radius:7px; border:1px solid {C_BORDER};
+        }}
+        QSlider::handle:horizontal:hover {{ background:{C_WHITE}; }}
+        QToolTip {{
+            background:{C_BG3}; color:{C_LIGHT}; border:1px solid {C_ORANGE};
+        }}
+        QScrollBar:vertical {{ background:{C_BG}; width:12px; }}
+        QScrollBar::handle:vertical {{
+            background:{C_VDGREY}; border-radius:6px; min-height:20px;
+        }}
+        QScrollBar::handle:vertical:hover {{ background:{C_ORANGE}; }}
+        QScrollBar::add-line, QScrollBar::sub-line {{ height:0; }}
+    """)
+
 
 ROOT_HELPER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "root_helper.py")
 NVCURVE_PROFILES_DIR = "/etc/nvcurve/profiles"
@@ -84,8 +187,11 @@ class VFCurveWidget(QChartView):
         self.chart = QChart()
         self.chart.setAnimationOptions(QChart.SeriesAnimations)
         self.chart.legend().hide()
-        self.chart.setBackgroundBrush(QColor(10, 10, 10))
+        self.chart.setBackgroundBrush(QColor(C_BG))
         self.chart.setBackgroundVisible(True)
+        self.chart.setPlotAreaBackgroundBrush(QColor("#241e1a"))
+        self.chart.setPlotAreaBackgroundVisible(True)
+        self.chart.setMargins(QMargins(4, 4, 4, 4))
         self.setChart(self.chart)
         self._create_series()
         self.setInteractive(True)
@@ -94,23 +200,33 @@ class VFCurveWidget(QChartView):
     def _create_series(self):
         self.chart.removeAllSeries()
         self.line_series = QLineSeries()
+        line_pen = QPen(QColor(C_ORANGE))
+        line_pen.setWidthF(2.4)
+        line_pen.setCosmetic(True)
+        self.line_series.setPen(line_pen)
         for v, f in self.points:
             self.line_series.append(v, f)
         self.chart.addSeries(self.line_series)
 
         self.scatter_series = QScatterSeries()
-        self.scatter_series.setMarkerSize(7)
+        self.scatter_series.setMarkerSize(8)
         self.scatter_series.setColor(QColor(C_CYAN))
-        self.scatter_series.setBorderColor(QColor(C_ORANGE))
+        sc_pen = QPen(QColor(C_BG))
+        sc_pen.setWidthF(1.2)
+        self.scatter_series.setPen(sc_pen)
+        self.scatter_series.setBorderColor(QColor(C_BG))
         self.scatter_series.clicked.connect(self._on_point_clicked)
         for v, f in self.points:
             self.scatter_series.append(v, f)
         self.chart.addSeries(self.scatter_series)
 
         self.selected_series = QScatterSeries()
-        self.selected_series.setMarkerSize(10)
+        self.selected_series.setMarkerSize(12)
         self.selected_series.setColor(QColor(C_YELLOW))
-        self.selected_series.setBorderColor(QColor(C_WHITE))
+        sel_pen = QPen(QColor(C_STOP))
+        sel_pen.setWidthF(2.0)
+        self.selected_series.setPen(sel_pen)
+        self.selected_series.setBorderColor(QColor(C_STOP))
         self.selected_series.clicked.connect(self._on_point_clicked)
         for i in self.selected_indices:
             if i < len(self.points):
@@ -122,8 +238,12 @@ class VFCurveWidget(QChartView):
         self.axis_x.setTitleText("Voltage (mV)")
         self.axis_x.setRange(600, 1200)
         self.axis_x.setTickCount(10)
-        self.axis_x.setLabelsColor(QColor(C_LIGHT))
-        self.axis_x.setTitleBrush(QBrush(QColor(C_LIGHT)))
+        self.axis_x.setLabelsColor(QColor(C_GREY))
+        self.axis_x.setTitleBrush(QBrush(QColor(C_YELLOW)))
+        self.axis_x.setLinePenColor(QColor(C_BORDER))
+        grid_pen_x = QPen(QColor(C_BG3))
+        grid_pen_x.setWidthF(1.0)
+        self.axis_x.setGridLinePen(grid_pen_x)
         self.chart.addAxis(self.axis_x, Qt.AlignBottom)
         self.line_series.attachAxis(self.axis_x)
         self.scatter_series.attachAxis(self.axis_x)
@@ -133,8 +253,12 @@ class VFCurveWidget(QChartView):
         self.axis_y.setTitleText("Frequency (MHz)")
         self.axis_y.setRange(800, 3000)
         self.axis_y.setTickCount(12)
-        self.axis_y.setLabelsColor(QColor(C_LIGHT))
-        self.axis_y.setTitleBrush(QBrush(QColor(C_LIGHT)))
+        self.axis_y.setLabelsColor(QColor(C_GREY))
+        self.axis_y.setTitleBrush(QBrush(QColor(C_YELLOW)))
+        self.axis_y.setLinePenColor(QColor(C_BORDER))
+        grid_pen_y = QPen(QColor(C_BG3))
+        grid_pen_y.setWidthF(1.0)
+        self.axis_y.setGridLinePen(grid_pen_y)
         self.chart.addAxis(self.axis_y, Qt.AlignLeft)
         self.line_series.attachAxis(self.axis_y)
         self.scatter_series.attachAxis(self.axis_y)
@@ -391,7 +515,6 @@ class NVCurveWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("nvcurve-gui — GPU V/F Curve Tuning")
         self.resize(980, 720)
-        self.setStyleSheet(f"background:{C_BG}; color:{C_LIGHT};")
 
         # State
         self._default_points = []
@@ -441,12 +564,12 @@ class NVCurveWindow(QMainWindow):
         # GPU Status
         info_group = QGroupBox(" GPU Status ")
         info_layout = QHBoxLayout(info_group)
-        self.gpu_temp = SL("Temp: -- °C", color=C_GREY)
-        self.gpu_mem_temp = SL("Mem Temp: -- °C", color=C_GREY)
-        self.gpu_hotspot_temp = SL("Hotspot: -- °C", color=C_GREY)
-        self.gpu_power = SL("Power: -- W", color=C_GREY)
-        self.gpu_clock = SL("Clock: -- MHz", color=C_GREY)
-        self.gpu_mem_clock = SL("Mem Clock: -- MHz", color=C_GREY)
+        self.gpu_temp = SL("Temp: -- °C", color=C_ORANGE, bold=True)
+        self.gpu_mem_temp = SL("Mem Temp: -- °C", color=C_ORANGE, bold=True)
+        self.gpu_hotspot_temp = SL("Hotspot: -- °C", color=C_STOP, bold=True)
+        self.gpu_power = SL("Power: -- W", color=C_YELLOW, bold=True)
+        self.gpu_clock = SL("Clock: -- MHz", color=C_CYAN, bold=True)
+        self.gpu_mem_clock = SL("Mem Clock: -- MHz", color=C_GREEN, bold=True)
         for w in (self.gpu_temp, self.gpu_mem_temp, self.gpu_hotspot_temp,
                   self.gpu_power, self.gpu_clock, self.gpu_mem_clock):
             info_layout.addWidget(w)
@@ -486,10 +609,10 @@ class NVCurveWindow(QMainWindow):
         info_panel_layout.setContentsMargins(6, 6, 6, 6)
         info_panel_layout.setSpacing(4)
 
-        self.point_index_label = SL("Selected: -", color=C_GREY)
-        self.point_voltage_label = SL("Voltage: - mV", color=C_GREY)
-        self.point_freq_label = SL("Freq: - MHz", color=C_GREY)
-        self.point_offset_label = SL("Offset: - MHz", color=C_GREY)
+        self.point_index_label = SL("Selected: -", color=C_YELLOW, bold=True)
+        self.point_voltage_label = SL("Voltage: - mV", color=C_CYAN)
+        self.point_freq_label = SL("Freq: - MHz", color=C_GREEN)
+        self.point_offset_label = SL("Offset: - MHz", color=C_ORANGE)
         self.point_offset_spin = QSpinBox()
         self.point_offset_spin.setRange(-1000, 1000)
         self.point_offset_spin.setValue(0)
@@ -1432,6 +1555,7 @@ class NVCurveWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("nvcurve-gui")
+    apply_theme(app)
     win = NVCurveWindow()
     win.show()
     sys.exit(app.exec())

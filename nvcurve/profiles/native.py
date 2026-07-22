@@ -10,8 +10,8 @@ from typing import Dict, Optional, List
 @dataclass
 class ProfileData:
     name: str
-    gpu_name: str
     curve_deltas: Dict[str, int]  # { "index": delta_khz }
+    gpu_name: str = ""  # optional; older profiles predate this field
     mem_offset_mhz: Optional[int] = None
     power_limit_w: Optional[int] = None
     mem_locked_min_mhz: Optional[int] = None

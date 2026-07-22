@@ -86,6 +86,30 @@ ok "Application files installed under $APP_DIR"
 install -d -o root -g root -m 0755 "$NVCURVE_PROFILES_DIR"
 ok "Profile directory ready: $NVCURVE_PROFILES_DIR"
 
+# ─── Migrate legacy profiles ───────────────────────────────────────────
+# Older profiles were saved before ProfileData grew a `gpu_name` field.
+# The loader now backfills gpu_name="" so they still apply, but we rewrite
+# them here so the on-disk files carry the field explicitly (keeps
+# list_profiles and future migrations clean).
+if compgen -G "$NVCURVE_PROFILES_DIR/*.json" >/dev/null 2>&1; then
+    PYTHONPATH="$APP_DIR" python3 - "$NVCURVE_PROFILES_DIR" <<'PYEOF' && \
+        ok "Legacy profiles migrated." || \
+        warn "Profile migration skipped (non-fatal; profiles still load at runtime)."
+import sys, glob, os
+from nvcurve.profiles.native import load_profile, save_profile
+prof_dir = sys.argv[1]
+migrated = 0
+for fp in glob.glob(os.path.join(prof_dir, "*.json")):
+    try:
+        p = load_profile(fp)            # backfills gpu_name="" if absent
+        save_profile(prof_dir, p)       # rewrites file with the full schema
+        migrated += 1
+    except Exception as e:
+        print(f"   - skipped {os.path.basename(fp)}: {e}", file=sys.stderr)
+print(f"   migrated {migrated} profile(s)")
+PYEOF
+fi
+
 # ─── Polkit policy ──────────────────────────────────────────────────────
 install -d -o root -g root -m 0755 "$POLKIT_ACTIONS_DIR"
 sed "s|/usr/local/lib/nvcurve-gui|$APP_DIR|g" "$SOURCE_DIR/com.nvcurve.gui.policy" \

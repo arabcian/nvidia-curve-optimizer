@@ -152,9 +152,49 @@ EOF
 chmod 0755 "$BIN_LINK"
 ok "Launcher installed: $BIN_LINK"
 
+
+# ─── Icon ───────────────────────────────────────────────────────────────
+# The app icon is drawn at runtime by _build_icon_pixmap() in
+# nvcurve_gui.py (a chip die + V/F curve, no external asset kept in the
+# repo). Render it once here to a real PNG so the .desktop launcher and
+# window managers that don't run the app first (app grids, alt-tab
+# switchers) have something to show.
+ICON_DIR="/usr/share/icons/hicolor/256x256/apps"
+TMP_ICON="$(mktemp --suffix=.png)"
+if python3 - "$APP_DIR/nvcurve_gui.py" "$TMP_ICON" << 'PYEOF'
+import os, sys
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+app_path, out_path = sys.argv[1], sys.argv[2]
+try:
+    from PySide6.QtWidgets import QApplication
+    import importlib.util
+    app = QApplication(["", "-platform", "offscreen"])
+    spec = importlib.util.spec_from_file_location("nvcurve_gui", app_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    px = mod._build_icon_pixmap(256)
+    sys.exit(0 if px.save(out_path, "PNG") else 1)
+except Exception as e:
+    print(f"icon render failed: {e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+then
+    install -d -o root -g root -m 0755 "$ICON_DIR"
+    install -o root -g root -m 0644 "$TMP_ICON" "$ICON_DIR/nvcurve-gui.png"
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
+    fi
+    ok "App icon installed: $ICON_DIR/nvcurve-gui.png"
+else
+    warn "Could not render app icon (PySide6 offscreen render failed); falling back to a generic icon."
+fi
+rm -f "$TMP_ICON"
+
 if [[ -f "$SOURCE_DIR/nvcurve-gui.desktop" ]]; then
     install -d -o root -g root -m 0755 /usr/share/applications
-    sed "s|/usr/local/bin/nvcurve-gui|$BIN_LINK|g" "$SOURCE_DIR/nvcurve-gui.desktop" \
+    sed -e "s|/usr/local/bin/nvcurve-gui|$BIN_LINK|g" \
+        -e "s|^Icon=.*|Icon=nvcurve-gui|" \
+        "$SOURCE_DIR/nvcurve-gui.desktop" \
         > /usr/share/applications/nvcurve-gui.desktop
     chmod 0644 /usr/share/applications/nvcurve-gui.desktop
     ok "Desktop launcher installed."

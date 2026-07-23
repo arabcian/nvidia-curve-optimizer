@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon, QMenu,
 )
 from PySide6.QtCharts import QChart, QChartView, QLineSeries, QScatterSeries, QValueAxis
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 # ─── Theme ───────────────────────────────────────────────────────────────
 C_BG = "#2b2420"
@@ -229,6 +230,56 @@ AUTOSTART_FILE = os.path.join(AUTOSTART_DIR, "nvcurve-gui.desktop")
 # Minimum gap between tray-triggered profile applies, to stop rapid-fire
 # clicking from queueing many privileged operations back to back.
 TRAY_APPLY_COOLDOWN_MS = 3000
+
+# Single-instance guard: a QLocalServer listening on this name acts as a
+# lock. A second launch connects as a client, asks the first instance to
+# raise its window, and exits immediately instead of running a duplicate
+# GUI (which would fight over the same GPU/root_helper state).
+SINGLE_INSTANCE_KEY = "nvcurve-gui-single-instance"
+
+
+class SingleInstanceGuard:
+    """Ensures only one nvcurve-gui process runs per user session.
+
+    Uses a QLocalServer as a named lock. If binding succeeds, this is the
+    first (primary) instance, and later launches' "show yourself" pings
+    are received here and forwarded to raise the existing window. If
+    binding fails, another instance already owns the lock: we ping it
+    (so it can raise its window) and the caller should exit.
+    """
+
+    def __init__(self, key=SINGLE_INSTANCE_KEY):
+        self._key = key
+        self.server = None
+
+    def try_acquire(self):
+        """Returns True if this process is the primary instance."""
+        # First check whether a server is genuinely alive at this name —
+        # only remove the socket file if nothing answers, since a crashed
+        # instance can leave a stale file behind, but a live instance
+        # must not have its lock ripped out from under it.
+        probe = QLocalSocket()
+        probe.connectToServer(self._key)
+        if probe.waitForConnected(200):
+            probe.disconnectFromServer()
+            return False
+        QLocalServer.removeServer(self._key)
+        server = QLocalServer()
+        server.setSocketOptions(QLocalServer.UserAccessOption)
+        if server.listen(self._key):
+            self.server = server
+            return True
+        return False
+
+    def notify_running_instance(self):
+        """Ping the primary instance to ask it to raise its window."""
+        sock = QLocalSocket()
+        sock.connectToServer(self._key)
+        if sock.waitForConnected(500):
+            sock.write(b"raise")
+            sock.flush()
+            sock.waitForBytesWritten(500)
+            sock.disconnectFromServer()
 
 
 def SL(text, color=C_LIGHT, bold=False, size=9):
@@ -637,6 +688,30 @@ class NVCurveWindow(QMainWindow):
         # profile once and stay hidden in the tray.
         if "--tray" in sys.argv:
             QTimer.singleShot(400, self._autoload_default_profile)
+
+    # ─── Single-instance ──────────────────────────────────────────────
+    def attach_single_instance_guard(self, guard):
+        """Wire the primary instance's QLocalServer to raise this window
+        whenever a second launch pings it instead of starting its own GUI."""
+        self._single_instance_guard = guard
+        guard.server.newConnection.connect(self._on_single_instance_ping)
+
+    def _on_single_instance_ping(self):
+        server = self._single_instance_guard.server
+        conn = server.nextPendingConnection()
+        if conn is not None:
+            conn.readyRead.connect(lambda: self._raise_from_second_instance(conn))
+
+    def _raise_from_second_instance(self, conn):
+        conn.readAll()  # drain the "raise" payload
+        conn.disconnectFromServer()
+        if self.isHidden():
+            self.show()
+        self.setWindowState(
+            (self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive
+        )
+        self.raise_()
+        self.activateWindow()
 
     # ─── Logging ─────────────────────────────────────────────────────
     def _log(self, text):
@@ -1682,35 +1757,8 @@ class NVCurveWindow(QMainWindow):
 
     # ─── System tray ─────────────────────────────────────────────────
     def _make_tray_icon(self):
-        """Build a themed tray icon: a small rising V/F curve on a dark
-        rounded tile, drawn at runtime so no external asset is needed."""
-        from PySide6.QtGui import QPixmap, QPainterPath
-        from PySide6.QtCore import QRectF
-        px = QPixmap(64, 64)
-        px.fill(QColor(0, 0, 0, 0))
-        p = QPainter(px)
-        p.setRenderHint(QPainter.Antialiasing)
-        # rounded background tile
-        p.setBrush(QColor(C_BG3))
-        p.setPen(QPen(QColor(C_BORDER), 2))
-        p.drawRoundedRect(QRectF(3, 3, 58, 58), 12, 12)
-        # rising curve
-        path = QPainterPath()
-        path.moveTo(14, 48)
-        path.cubicTo(28, 46, 34, 26, 50, 16)
-        pen = QPen(QColor(C_ORANGE), 5)
-        pen.setCapStyle(Qt.RoundCap)
-        p.setPen(pen)
-        p.setBrush(Qt.NoBrush)
-        p.drawPath(path)
-        # a couple of node dots
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(C_YELLOW))
-        p.drawEllipse(QPointF(50, 16), 4, 4)
-        p.setBrush(QColor(C_CYAN))
-        p.drawEllipse(QPointF(14, 48), 3.5, 3.5)
-        p.end()
-        return QIcon(px)
+        """Themed tray icon — see module-level _build_icon_pixmap()."""
+        return QIcon(_build_icon_pixmap(64))
 
     def _setup_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -1857,6 +1905,7 @@ class NVCurveWindow(QMainWindow):
             "Name=nvcurve-gui\n"
             "Comment=Apply default GPU V/F curve profile and sit in the tray\n"
             f"Exec={exec_cmd}\n"
+            "Icon=nvcurve-gui\n"
             "Terminal=false\n"
             "X-GNOME-Autostart-enabled=true\n"
         )
@@ -1885,15 +1934,133 @@ class NVCurveWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def _build_icon_pixmap(size=256):
+    """Draws the nvcurve-gui app icon at runtime (no external asset needed).
+
+    Concept: a GPU die viewed from above — a rounded chip body with
+    contact pins on two edges, and a glowing V/F curve arcing across the
+    die itself, rising through a couple of voltage/frequency "step"
+    nodes towards a small spark/bolt accent at the peak. Reads as both
+    "GPU" and "curve tuning" at a glance, distinct from a generic
+    monitor/display icon.
+    """
+    from PySide6.QtGui import QPixmap, QPainterPath, QLinearGradient, QRadialGradient
+    from PySide6.QtCore import QRectF
+
+    s = size / 64.0  # scale factor from the 64px design grid
+    px = QPixmap(size, size)
+    px.fill(QColor(0, 0, 0, 0))
+    p = QPainter(px)
+    p.setRenderHint(QPainter.Antialiasing)
+
+    def r(v):
+        return v * s
+
+    # Background tile: rounded square with a subtle vertical gradient so
+    # it doesn't read as flat as the old solid-fill tile.
+    bg_grad = QLinearGradient(0, 0, 0, r(64))
+    bg_grad.setColorAt(0.0, QColor(C_BG3))
+    bg_grad.setColorAt(1.0, QColor(C_BG))
+    p.setBrush(QBrush(bg_grad))
+    p.setPen(QPen(QColor(C_BORDER), r(2)))
+    p.drawRoundedRect(QRectF(r(3), r(3), r(58), r(58)), r(14), r(14))
+
+    # Chip die: a smaller rounded square inset within the tile.
+    die_rect = QRectF(r(15), r(15), r(34), r(34))
+    p.setBrush(QColor(C_BORDER))
+    p.setPen(QPen(QColor(C_VDGREY), r(1.5)))
+    p.drawRoundedRect(die_rect, r(6), r(6))
+
+    # Contact pins along the top and bottom edges of the die, echoing a
+    # real GPU package without needing fine per-pixel detail.
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(C_GREY))
+    pin_xs = [r(20), r(26), r(32), r(38), r(44)]
+    for x in pin_xs:
+        p.drawRect(QRectF(x, r(10), r(2.2), r(6)))
+        p.drawRect(QRectF(x, r(48), r(2.2), r(6)))
+
+    # The V/F curve itself, rising across the die like a step/ramp
+    # profile — this is the part that says "curve tuning", not just
+    # "GPU".
+    path = QPainterPath()
+    path.moveTo(r(19), r(38))
+    path.lineTo(r(26), r(38))
+    path.lineTo(r(30), r(28))
+    path.lineTo(r(37), r(28))
+    path.lineTo(r(41), r(18))
+    path.lineTo(r(46), r(18))
+    pen = QPen(QColor(C_ORANGE), r(3.2))
+    pen.setJoinStyle(Qt.RoundJoin)
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawPath(path)
+
+    # Node dots at each step of the curve.
+    p.setPen(Qt.NoPen)
+    for pt, color in (
+        (QPointF(r(19), r(38)), C_CYAN),
+        (QPointF(r(30), r(28)), C_YELLOW),
+        (QPointF(r(41), r(18)), C_YELLOW),
+        (QPointF(r(46), r(18)), C_GREEN),
+    ):
+        p.setBrush(QColor(color))
+        p.drawEllipse(pt, r(2.6), r(2.6))
+
+    # A small glowing spark above the peak node — the "overclocked"
+    # accent that distinguishes this from a plain line chart icon.
+    glow = QRadialGradient(QPointF(r(46), r(12)), r(7))
+    glow.setColorAt(0.0, QColor(C_YELLOW).lighter(130))
+    glow.setColorAt(1.0, QColor(255, 255, 255, 0))
+    p.setBrush(QBrush(glow))
+    p.setPen(Qt.NoPen)
+    p.drawEllipse(QPointF(r(46), r(12)), r(7), r(7))
+    bolt = QPainterPath()
+    bolt.moveTo(r(47.5), r(7))
+    bolt.lineTo(r(44), r(12.5))
+    bolt.lineTo(r(46.5), r(12.5))
+    bolt.lineTo(r(44.5), r(17.5))
+    bolt.lineTo(r(49), r(11))
+    bolt.lineTo(r(46.5), r(11))
+    bolt.closeSubpath()
+    p.setBrush(QColor(C_WHITE))
+    p.drawPath(bolt)
+
+    p.end()
+    return px
+
+
+def _make_app_icon():
+    """Multi-resolution QIcon for the window/taskbar (built once at startup;
+    same design as the tray icon, rendered at a size that stays crisp at
+    typical taskbar/alt-tab sizes)."""
+    icon = QIcon()
+    for sz in (16, 24, 32, 48, 64, 128, 256):
+        icon.addPixmap(_build_icon_pixmap(sz))
+    return icon
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("nvcurve-gui")
+
+    # Single-instance guard: if another nvcurve-gui is already running,
+    # ping it to raise its window and exit instead of starting a second
+    # GUI on top of the same GPU/root_helper state.
+    guard = SingleInstanceGuard()
+    is_primary = guard.try_acquire()
+    if not is_primary:
+        guard.notify_running_instance()
+        return
+
     apply_theme(app)
     # Hiding the window to the tray must not quit the app.
     app.setQuitOnLastWindowClosed(False)
     win = NVCurveWindow()
-    if win.tray_icon is not None:
-        app.setWindowIcon(win.windowIcon())
+    win.attach_single_instance_guard(guard)
+    win.setWindowIcon(_make_app_icon())
+    app.setWindowIcon(win.windowIcon())
     # --tray (autostart on login): start hidden in the tray. If the tray
     # isn't available, fall back to showing the window normally.
     if "--tray" in sys.argv and win.tray_icon is not None:

@@ -1120,6 +1120,15 @@ class NVCurveWindow(QMainWindow):
             self.point_offset_spin.blockSignals(False)
 
     def _reset_graph_to_last_read(self):
+        # The graph is about to be reverted to the last-read hardware
+        # values, so any profile shown as "selected" in the combo box no
+        # longer matches what's displayed — deselect it (blank the combo)
+        # rather than leaving a stale profile name shown. We only clear
+        # the selection here, never the list itself.
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.setCurrentIndex(-1)
+        self.profile_combo.blockSignals(False)
+
         if not self._read_offsets:
             self._core_offset = getattr(self, '_read_core_offset', 0)
             self._point_offsets = {}
@@ -1632,6 +1641,11 @@ class NVCurveWindow(QMainWindow):
     def _after_reset_read(self, res):
         self.btn_reset_curve.setEnabled(True)
         self.btn_reset_curve.setText("↺ Reset Curve")
+        # The curve was just reset to stock — deselect any profile shown
+        # in the combo box (list stays intact, only the selection clears).
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.setCurrentIndex(-1)
+        self.profile_combo.blockSignals(False)
         if res is None:
             self._log("❌ Reset operation failed.")
             return

@@ -1,10 +1,13 @@
 """Native profile storage and schema."""
 
 import json
+import logging
 import os
 import glob
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, List
+
+log = logging.getLogger("nvcurve.profiles.native")
 
 
 @dataclass
@@ -19,15 +22,30 @@ class ProfileData:
 
 
 def save_profile(profile_dir: str, data: ProfileData) -> str:
-    """Save profile to JSON, sanitising the filename."""
+    """Save profile to JSON, sanitising the filename.
+
+    Modes are set explicitly rather than left to the umask: this runs as
+    root from the CLI/daemon, and `sudo nvcurve ...` inherits the invoking
+    user's umask, so a permissive umask would otherwise decide the
+    permissions of a root-owned directory and file under /etc.
+    """
     os.makedirs(profile_dir, exist_ok=True)
+    try:
+        os.chmod(profile_dir, 0o755)
+    except OSError:
+        pass
+
     safe_name = "".join(c for c in data.name if c.isalnum() or c in " _-()").strip()
     if not safe_name:
         safe_name = "Unnamed"
-        
+
     filepath = os.path.join(profile_dir, f"{safe_name}.json")
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(asdict(data), f, indent=2)
+    try:
+        os.chmod(filepath, 0o644)
+    except OSError:
+        pass
     return filepath
 
 
@@ -53,8 +71,10 @@ def list_profiles(profile_dir: str) -> List[ProfileData]:
         try:
             profiles.append(load_profile(fp))
         except Exception as e:
-            # log warning ideally, but swallowing for robustness
-            pass
+            # Keep going so one bad file doesn't hide every other profile,
+            # but say so — silently swallowing this meant a corrupted or
+            # tampered profile simply vanished from the list with no trace.
+            log.warning("Skipping unreadable profile %s: %s", fp, e)
     # Sort alphabetically by name
     profiles.sort(key=lambda p: p.name.lower())
     return profiles

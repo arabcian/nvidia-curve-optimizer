@@ -9,9 +9,47 @@ from ..nvapi.bootstrap import nvcall, nvcall_raw
 from ..nvapi.constants import (
     FUNC,
     VFP_SIZE, VFP_BASE, VFP_STRIDE,
-    CT_SIZE, CT_BASE, CT_STRIDE, CT_DELTA_OFF,
+    CT_SIZE, CT_BASE, CT_STRIDE, CT_DELTA_OFF, CT_POINTS,
 )
 from ..nvapi.types import VFPoint, CurveState
+
+_INT32_MIN = -(2 ** 31)
+_INT32_MAX = 2 ** 31 - 1
+
+
+def _check_point(point: int) -> None:
+    """Reject a point index that would write outside its own table entry.
+
+    SECURITY: this guard belongs here, at the sink, not only in
+    safety.validate_write(). Both ctypes buffer indexing and
+    struct.pack_into() accept NEGATIVE offsets and silently wrap to the end
+    of the buffer rather than raising:
+
+        struct.pack_into("<i", buf, -4, 1)   # no error — writes last 4 bytes
+
+    So a negative index does not fail loudly; it corrupts the mask bytes,
+    the version word, or an unrelated entry of the ClockBoostTable struct
+    that is then handed to SetClockBoostTable. Every API path did call
+    validate_write() first, but `nvcurve setup --point` did not, which made
+    the whole protection one forgotten call site deep.
+    """
+    if isinstance(point, bool) or not isinstance(point, int):
+        raise ValueError(f"point index must be an int, got {type(point).__name__}")
+    if not (0 <= point < CT_POINTS):
+        raise ValueError(f"point {point} out of range (0-{CT_POINTS - 1})")
+
+
+def _check_delta(delta_khz: int, point: int) -> None:
+    """Reject a delta that doesn't fit the driver's signed 32-bit freqDelta field."""
+    if isinstance(delta_khz, bool) or not isinstance(delta_khz, int):
+        raise ValueError(
+            f"delta for point {point} must be an int, got {type(delta_khz).__name__}"
+        )
+    if not (_INT32_MIN <= delta_khz <= _INT32_MAX):
+        raise ValueError(
+            f"delta {delta_khz} kHz for point {point} does not fit the driver's "
+            f"signed 32-bit freqDelta field"
+        )
 
 
 # ── Mask helpers ─────────────────────────────────────────────────────────────
@@ -57,6 +95,7 @@ def get_boost_mask(gpu) -> tuple[Optional[bytes], str]:
 
 def set_mask_bit(buf, point: int, offset: int = 4) -> None:
     """Set a single bit in the 256-bit mask for one point."""
+    _check_point(point)
     byte_idx = offset + (point // 8)
     bit_idx = point % 8
     buf[byte_idx] = int.from_bytes(buf[byte_idx:byte_idx + 1], "little") | (1 << bit_idx)
@@ -278,6 +317,12 @@ def build_write_buffer(
 
     Returns (mutable_buffer, "OK") or (None, error).
     """
+    # Validate the whole request up front — before any buffer is built — so a
+    # bad index can't leave a half-mutated table behind.
+    for point, delta_khz in point_deltas.items():
+        _check_point(point)
+        _check_delta(delta_khz, point)
+
     if current_raw is None:
         current_raw, err = read_clock_table_raw(gpu)
         if not current_raw:
@@ -303,6 +348,8 @@ def build_write_buffer(
         set_mask_bits(buf, set(point_deltas.keys()))
 
     for point, delta_khz in point_deltas.items():
+        _check_point(point)
+        _check_delta(delta_khz, point)
         off = CT_BASE + point * CT_STRIDE + CT_DELTA_OFF
         struct.pack_into("<i", buf, off, delta_khz)
 
@@ -328,7 +375,15 @@ def write_offsets(
 
     Returns (return_code, description).
     """
-    buf, err = build_write_buffer(gpu, point_deltas, full_mask=full_mask, current_raw=current_raw)
+    try:
+        buf, err = build_write_buffer(
+            gpu, point_deltas, full_mask=full_mask, current_raw=current_raw
+        )
+    except ValueError as exc:
+        # Bounds/type rejection from _check_point/_check_delta. Reported
+        # through the normal (ret, desc) contract so every existing caller
+        # surfaces it as a failed write instead of an unhandled traceback.
+        return -998, f"Rejected unsafe write: {exc}"
     if buf is None:
         return -999, err
 

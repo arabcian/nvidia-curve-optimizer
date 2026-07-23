@@ -159,9 +159,26 @@ ok "Launcher installed: $BIN_LINK"
 # repo). Render it once here to a real PNG so the .desktop launcher and
 # window managers that don't run the app first (app grids, alt-tab
 # switchers) have something to show.
+#
+# SECURITY NOTE: rendering the icon means importing and executing
+# nvcurve_gui.py's module-level code. That is done as the *invoking* user
+# (via runuser when we were called through sudo), not as root — there is no
+# reason for GUI code and the whole PySide6/Qt stack it drags in to run with
+# root privileges just to produce a PNG. The result is installed by root
+# afterwards, which is the only step that actually needs privilege.
 ICON_DIR="/usr/share/icons/hicolor/256x256/apps"
 TMP_ICON="$(mktemp --suffix=.png)"
-if python3 - "$APP_DIR/nvcurve_gui.py" "$TMP_ICON" << 'PYEOF'
+chmod 0644 "$TMP_ICON"
+
+ICON_RENDER_USER="${SUDO_USER:-root}"
+if [[ "$ICON_RENDER_USER" != "root" ]]; then
+    chown "$ICON_RENDER_USER" "$TMP_ICON" 2>/dev/null || true
+    RENDER_CMD=(runuser -u "$ICON_RENDER_USER" -- python3 -)
+else
+    RENDER_CMD=(python3 -)
+fi
+
+if "${RENDER_CMD[@]}" "$APP_DIR/nvcurve_gui.py" "$TMP_ICON" << 'PYEOF'
 import os, sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 app_path, out_path = sys.argv[1], sys.argv[2]

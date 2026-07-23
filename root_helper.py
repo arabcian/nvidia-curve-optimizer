@@ -49,6 +49,79 @@ PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MAX_PROFILE_BYTES = 256 * 1024  # 256 KB
 MAX_STDIN_BYTES = 1024 * 1024  # 1 MB — generous headroom over MAX_PROFILE_BYTES
 
+# ─── profile_data schema ────────────────────────────────────────────────
+# The apply path used to accept ANY dict as profile_data — it was checked
+# only for "is a dict" and "under 256 KB" — then written to a root-owned
+# file under /etc and handed to `nvcurve profile apply`. Meanwhile
+# op_set_vram_memlock carefully type- and range-checked the very same
+# min/max values when they arrived as direct parameters. Same fields, same
+# privilege, two different standards. This closes that gap on the way in.
+_PROFILE_FIELDS = {
+    "name": str,
+    "gpu_name": str,
+    "curve_deltas": dict,
+    "mem_offset_mhz": int,
+    "power_limit_w": int,
+    "mem_locked_min_mhz": int,
+    "mem_locked_max_mhz": int,
+}
+
+# Generous sanity bounds. These are NOT a substitute for the driver-range
+# checks in nvcurve.safety.validate_limits (which run later, with the actual
+# GPU's reported ranges) — they only reject values that are obviously not
+# the quantity they claim to be.
+_PROFILE_BOUNDS = {
+    "mem_offset_mhz": (-100_000, 100_000),
+    "power_limit_w": (1, 2_000),
+    "mem_locked_min_mhz": (1, 100_000),
+    "mem_locked_max_mhz": (1, 100_000),
+}
+
+_MAX_CURVE_POINTS = 512
+
+
+def _validate_profile_data(data: dict) -> str:
+    """Return an error string for an invalid profile_data dict, or "" if OK."""
+    for key, value in data.items():
+        if key not in _PROFILE_FIELDS:
+            return f"unknown profile field: {key!r}"
+        if value is None:
+            continue
+        expected = _PROFILE_FIELDS[key]
+        # bool is a subclass of int — reject it explicitly for numeric fields.
+        if expected is int and isinstance(value, bool):
+            return f"field {key!r} must be an integer, not a boolean"
+        if not isinstance(value, expected):
+            return f"field {key!r} must be {expected.__name__}, got {type(value).__name__}"
+        if key in _PROFILE_BOUNDS:
+            lo, hi = _PROFILE_BOUNDS[key]
+            if not (lo <= value <= hi):
+                return f"field {key!r} value {value} outside plausible range ({lo}..{hi})"
+
+    if isinstance(data.get("name"), str) and not PROFILE_NAME_RE.match(data["name"]):
+        return "profile_data 'name' field has an invalid name"
+
+    deltas = data.get("curve_deltas")
+    if isinstance(deltas, dict):
+        if len(deltas) > _MAX_CURVE_POINTS:
+            return f"curve_deltas has too many entries (max {_MAX_CURVE_POINTS})"
+        for point_key, delta in deltas.items():
+            if not isinstance(point_key, str) or not point_key.lstrip("-").isdigit():
+                return f"curve_deltas key {point_key!r} is not an integer string"
+            if not (0 <= int(point_key) < _MAX_CURVE_POINTS):
+                return f"curve_deltas point index {point_key} out of range"
+            if isinstance(delta, bool) or not isinstance(delta, int):
+                return f"curve_deltas value for point {point_key} must be an integer"
+            if not (-2_000_000 <= delta <= 2_000_000):
+                return f"curve_deltas delta for point {point_key} is implausible: {delta}"
+
+    min_mhz = data.get("mem_locked_min_mhz")
+    max_mhz = data.get("mem_locked_max_mhz")
+    if isinstance(min_mhz, int) and isinstance(max_mhz, int) and min_mhz > max_mhz:
+        return f"mem_locked_min_mhz ({min_mhz}) is greater than mem_locked_max_mhz ({max_mhz})"
+
+    return ""
+
 
 def _atomic_write_run_json(target_path: str, data) -> None:
     """Write `data` as JSON to `target_path` (which MUST live directly
@@ -84,6 +157,27 @@ def _atomic_write_run_json(target_path: str, data) -> None:
         except OSError:
             pass
         raise
+
+
+def _ensure_profiles_dir() -> None:
+    """Create /etc/nvcurve/profiles with an explicitly enforced 0755 mode.
+
+    SECURITY: os.makedirs()'s mode argument is masked by the process umask,
+    and pkexec — unlike sudo — does NOT reset the umask of the program it
+    launches. It is inherited from the calling GUI, i.e. from the
+    unprivileged user. So a user who runs `umask 000` before starting
+    nvcurve-gui previously caused this root-owned directory under /etc to be
+    created world-writable (0777), letting any local account drop profile
+    JSON that root would later read and apply.
+
+    The explicit chmod after creation is what actually guarantees the mode;
+    passing mode= to makedirs alone is not sufficient for the same reason.
+    """
+    os.makedirs(NVCURVE_PROFILES_DIR, exist_ok=True)
+    try:
+        os.chmod(NVCURVE_PROFILES_DIR, 0o755)
+    except OSError:
+        pass
 
 
 def _nvcurve_env():
@@ -146,6 +240,9 @@ def op_apply_gpu_offsets(params: dict) -> dict:
         return {"ok": False, "error": "profile_data must be an object"}
     if len(json.dumps(profile_data)) > MAX_PROFILE_BYTES:
         return {"ok": False, "error": "profile_data too large"}
+    schema_err = _validate_profile_data(profile_data)
+    if schema_err:
+        return {"ok": False, "error": f"Invalid profile_data: {schema_err}"}
 
     # 1. Reset the curve first so the profile applies cleanly on top.
     reset_result = _run_nvcurve("write", "--range", "0-132", "--delta", "0")
@@ -153,7 +250,7 @@ def op_apply_gpu_offsets(params: dict) -> dict:
         return {"ok": False, "error": f"Reset failed: {reset_result.stderr.strip()}"}
 
     # 2. Persist the profile JSON and apply it.
-    os.makedirs(NVCURVE_PROFILES_DIR, exist_ok=True)
+    _ensure_profiles_dir()
     profile_path = os.path.join(NVCURVE_PROFILES_DIR, f"{profile_name}.json")
     if os.path.dirname(os.path.abspath(profile_path)) != os.path.abspath(NVCURVE_PROFILES_DIR):
         return {"ok": False, "error": "Path traversal detected"}
@@ -269,7 +366,7 @@ def op_write_nvcurve_profile(params: dict) -> dict:
     except json.JSONDecodeError as e:
         return {"ok": False, "error": f"content is not valid JSON: {e}"}
 
-    os.makedirs(NVCURVE_PROFILES_DIR, exist_ok=True, mode=0o755)
+    _ensure_profiles_dir()
     target_path = os.path.join(NVCURVE_PROFILES_DIR, f"{name}.json")
     if os.path.dirname(os.path.abspath(target_path)) != os.path.abspath(NVCURVE_PROFILES_DIR):
         return {"ok": False, "error": "Path traversal detected"}
@@ -383,6 +480,12 @@ def main() -> int:
     if os.geteuid() != 0:
         print(json.dumps({"ok": False, "error": "root_helper must run as root"}))
         return 1
+
+    # pkexec does not reset the umask — it is inherited straight from the
+    # unprivileged caller. Every file and directory this process creates as
+    # root would otherwise have permissions chosen by the user who invoked
+    # it. Pin it here, once, so no individual op has to remember.
+    os.umask(0o022)
 
     raw = sys.stdin.read(MAX_STDIN_BYTES + 1)
     if len(raw.encode()) > MAX_STDIN_BYTES:

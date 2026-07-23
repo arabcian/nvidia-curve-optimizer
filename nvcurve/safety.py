@@ -14,6 +14,13 @@ from .nvapi.constants import CT_POINTS, MAX_DELTA_KHZ
 _INT32_MIN = -(2 ** 31)
 _INT32_MAX = 2 ** 31 - 1
 
+# Upper sanity bound for a memory locked-clock value, in MHz. NVML snaps an
+# unsupported value to the nearest supported clock instead of rejecting it,
+# so this is not a correctness check — it only rejects values that are
+# obviously not a clock at all (negative, zero, or absurdly large), which
+# would otherwise be passed straight into nvmlDeviceSetMemoryLockedClocks.
+MAX_MEM_CLOCK_MHZ = 100_000
+
 
 def check_negative_freq_warnings(
     point_deltas: dict[int, int],
@@ -51,6 +58,94 @@ def check_negative_freq_warnings(
                 f"effective frequency {new_effective / 1000:.0f} MHz — driver will clamp to 0."
             )
     return warnings
+
+
+def validate_limits(
+    gpu_index: int,
+    power_limit_w: int | None = None,
+    mem_offset_mhz: int | None = None,
+    mem_locked_min_mhz: int | None = None,
+    mem_locked_max_mhz: int | None = None,
+) -> list[str]:
+    """Validate the non-curve ("secondary") settings against driver-reported ranges.
+
+    Returns a list of error strings; empty means the values are acceptable.
+
+    This is the single implementation of these checks. The REST endpoint
+    (/api/limits) used to carry its own inline copy while the profile-apply
+    path (profiles/apply.py, and root_helper's apply_gpu_offsets which feeds
+    it) applied the very same fields with no bounds checking at all — so the
+    same out-of-range value was rejected with a clear 400 over HTTP but
+    passed straight to NVML when it arrived inside a profile. Both callers
+    now go through here.
+
+    Driver queries that fail are treated as "can't validate" rather than
+    "invalid": a missing range must not block an otherwise legitimate apply
+    on a GPU/driver combination that doesn't report it.
+    """
+    from .hal.limits import get_power_limit, get_mem_offset_range
+
+    errors: list[str] = []
+
+    if power_limit_w is not None:
+        if not isinstance(power_limit_w, int) or isinstance(power_limit_w, bool):
+            errors.append("power_limit_w must be an integer")
+        else:
+            try:
+                info = get_power_limit(gpu_index)
+                min_w, max_w = info.get("min_power_limit_w"), info.get("max_power_limit_w")
+            except Exception:
+                min_w = max_w = None
+            if min_w is not None and max_w is not None and not (min_w <= power_limit_w <= max_w):
+                errors.append(
+                    f"power_limit_w {power_limit_w} is outside the driver's "
+                    f"reported range ({min_w}-{max_w} W)"
+                )
+
+    if mem_offset_mhz is not None:
+        if not isinstance(mem_offset_mhz, int) or isinstance(mem_offset_mhz, bool):
+            errors.append("mem_offset_mhz must be an integer")
+        else:
+            try:
+                rng = get_mem_offset_range(gpu_index)
+                min_off, max_off = rng.get("min_mem_offset_mhz"), rng.get("max_mem_offset_mhz")
+            except Exception:
+                min_off = max_off = None
+            if min_off is not None and max_off is not None and not (min_off <= mem_offset_mhz <= max_off):
+                errors.append(
+                    f"mem_offset_mhz {mem_offset_mhz} is outside the driver's "
+                    f"reported range ({min_off}-{max_off} MHz)"
+                )
+
+    for label, val in (("mem_locked_min_mhz", mem_locked_min_mhz),
+                       ("mem_locked_max_mhz", mem_locked_max_mhz)):
+        if val is None:
+            continue
+        if not isinstance(val, int) or isinstance(val, bool):
+            errors.append(f"{label} must be an integer")
+        elif not (0 < val <= MAX_MEM_CLOCK_MHZ):
+            errors.append(
+                f"{label} {val} is outside the plausible range "
+                f"(1-{MAX_MEM_CLOCK_MHZ} MHz)"
+            )
+
+    if (
+        isinstance(mem_locked_min_mhz, int) and isinstance(mem_locked_max_mhz, int)
+        and not isinstance(mem_locked_min_mhz, bool) and not isinstance(mem_locked_max_mhz, bool)
+        and mem_locked_min_mhz > mem_locked_max_mhz
+    ):
+        # The driver snaps an out-of-range single value to its nearest
+        # supported clock rather than erroring (see hal/limits.py's
+        # get_current_mem_clock() docstring), so a full bounds check against
+        # the supported-clock list would just duplicate that silently
+        # permissive behaviour. An inverted min > max is unambiguously a
+        # caller mistake, though.
+        errors.append(
+            f"mem_locked_min_mhz ({mem_locked_min_mhz}) is greater than "
+            f"mem_locked_max_mhz ({mem_locked_max_mhz})"
+        )
+
+    return errors
 
 
 def validate_write(

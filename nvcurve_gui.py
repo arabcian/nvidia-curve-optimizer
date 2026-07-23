@@ -21,6 +21,7 @@ file (see install.sh).
 import fcntl
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -210,6 +211,36 @@ def apply_theme(app):
 
 
 ROOT_HELPER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "root_helper.py")
+
+
+def _root_helper_is_trusted(path: str) -> tuple[bool, str]:
+    """Check that the helper we're about to run as root can't have been tampered with.
+
+    ROOT_HELPER_PATH is derived from __file__, so running nvcurve_gui.py out
+    of a source checkout points it at a copy inside the user's own home
+    directory. pkexec will happily execute that as root once authorized — it
+    does not require the target to be root-owned. The installed polkit rule
+    is pinned to the installed path so a checkout would at least prompt for a
+    password rather than run passwordless, but "prompt, then run a
+    user-writable script as root" is still a bad outcome worth refusing.
+
+    Returns (trusted, reason).
+    """
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        return False, f"cannot stat {path}: {exc}"
+    if st.st_uid != 0:
+        return False, (
+            f"{path} is not owned by root (uid {st.st_uid}). Refusing to run it "
+            "as root — install with ./install.sh and launch via nvcurve-gui."
+        )
+    if st.st_mode & stat.S_IWGRP or st.st_mode & stat.S_IWOTH:
+        return False, (
+            f"{path} is group- or world-writable (mode {st.st_mode & 0o777:04o}). "
+            "Refusing to run it as root."
+        )
+    return True, ""
 NVCURVE_PROFILES_DIR = "/etc/nvcurve/profiles"
 NVCURVE_CONFIG_PATH = "/etc/nvcurve/config.json"
 RUN_DIR = "/run/nvcurve-gui"
@@ -252,9 +283,31 @@ TRAY_SETUP_MAX_RETRIES = 15
 # to raise the existing window — that IPC channel is never involved in
 # deciding who the primary instance is.
 SINGLE_INSTANCE_KEY = "nvcurve-gui-single-instance"
+
+
+def _single_instance_lock_dir() -> str:
+    """Pick a per-user, non-world-writable directory for the lock file.
+
+    The old fallback was tempfile.gettempdir() — i.e. /tmp/nvcurve-gui.lock,
+    a fixed name in a world-writable directory. Any other local account could
+    pre-create or hold that path to keep this GUI from ever starting, or
+    point it somewhere unexpected via a symlink. XDG_RUNTIME_DIR is 0700 and
+    correct when present; ~/.cache is the right fallback when it isn't.
+    """
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir and os.path.isdir(runtime_dir):
+        return runtime_dir
+    cache_dir = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    target = os.path.join(cache_dir, "nvcurve-gui")
+    try:
+        os.makedirs(target, mode=0o700, exist_ok=True)
+        return target
+    except OSError:
+        return tempfile.gettempdir()
+
+
 SINGLE_INSTANCE_LOCK_PATH = os.path.join(
-    os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(),
-    "nvcurve-gui.lock",
+    _single_instance_lock_dir(), "nvcurve-gui.lock"
 )
 
 
@@ -625,6 +678,11 @@ class RootHelperWorker(QThread):
     def run(self):
         proc = None
         try:
+            trusted, reason = _root_helper_is_trusted(ROOT_HELPER_PATH)
+            if not trusted:
+                self.finished_err.emit(reason)
+                return
+
             json_arg = json.dumps(self.payload_dict)
             env = os.environ.copy()
             for var in ('DISPLAY', 'XAUTHORITY', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS'):

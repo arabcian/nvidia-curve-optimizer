@@ -25,7 +25,14 @@ def save(gpu, gpu_name: str, snapshot_dir: str, max_snapshots: int = 0) -> Optio
         print(f"Failed to read ClockBoostTable: {err}")
         return None
 
+    # Explicit mode, not umask-derived — this runs as root and `sudo nvcurve`
+    # inherits the caller's umask (see profiles/native.py:save_profile).
     os.makedirs(snapshot_dir, exist_ok=True)
+    try:
+        os.chmod(snapshot_dir, 0o755)
+    except OSError:
+        pass
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     bin_path = os.path.join(snapshot_dir, f"clock_boost_table_{ts}.bin")
     meta_path = os.path.join(snapshot_dir, f"clock_boost_table_{ts}.json")

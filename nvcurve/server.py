@@ -63,7 +63,7 @@ from .hal.vfcurve import (
     write_global_offset,
     write_offsets,
 )
-from .safety import validate_write, check_negative_freq_warnings
+from .safety import validate_write, validate_limits, check_negative_freq_warnings
 
 log = logging.getLogger("nvcurve.server")
 
@@ -184,6 +184,20 @@ async def _monitor_poller(gpu_index: int) -> None:
 async def lifespan(app: FastAPI):
     loop = asyncio.get_running_loop()
 
+    # NvAPI writes require root. cli.py's `serve start` already calls
+    # require_root(), but the app object is also reachable via
+    # `uvicorn nvcurve.server:app` and create_app(), which bypass the CLI
+    # entirely — fail loudly here instead of dying with opaque NvAPI errors
+    # somewhere deep in the first write.
+    if os.geteuid() != 0:
+        raise RuntimeError(
+            "nvcurve server must run as root (NvAPI/NVML writes require it)."
+        )
+
+    # Publish the API token now that we're actually starting a server (see
+    # _write_token_file's docstring for why this is not done at import time).
+    _write_token_file()
+
     # Initialize NVML (best-effort)
     await loop.run_in_executor(None, init_nvml)
 
@@ -262,6 +276,7 @@ async def lifespan(app: FastAPI):
             pass
 
     await loop.run_in_executor(None, shutdown_nvml)
+    _remove_token_file()
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -304,8 +319,22 @@ _TOKEN_FILE = "/run/nvcurve.token"
 
 
 def _write_token_file() -> None:
+    """Publish this run's API token to a root-only-readable file.
+
+    Hardening notes:
+      - O_NOFOLLOW: refuse to follow a pre-planted symlink at _TOKEN_FILE.
+        /run is root-owned 0755 so this is defence in depth, but it matches
+        the pattern root_helper.py already uses for its result files.
+      - Called from lifespan(), NOT at module import. Importing this module
+        used to overwrite the token file as a side effect, so a second
+        process merely importing nvcurve.server (a stray `uvicorn
+        nvcurve.server:app`, a test, a second `serve start --direct`) would
+        silently invalidate a *running* server's token and 401 all of its
+        clients.
+    """
     try:
-        fd = os.open(_TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+        fd = os.open(_TOKEN_FILE, flags, 0o600)
         try:
             os.write(fd, _API_TOKEN.encode())
         finally:
@@ -317,20 +346,45 @@ def _write_token_file() -> None:
         )
 
 
-_write_token_file()
+def _remove_token_file() -> None:
+    """Delete the token file so a dead server doesn't leave a stale token behind."""
+    try:
+        os.unlink(_TOKEN_FILE)
+    except OSError:
+        pass
+
+
+# Paths reachable WITHOUT a token. This is a strict allowlist: anything not
+# named here requires the token, including routes added in the future.
+#
+# The previous design was the inverse — it demanded a token only for paths
+# starting with "/api/" or "/ws/" and let everything else through. That is
+# fail-open: a route registered outside those two prefixes was silently
+# unauthenticated, which is exactly how the SPA catch-all (`/{catchall:path}`,
+# a root-privileged FileResponse) ended up publicly reachable. An allowlist
+# fails closed instead — a new route is protected until someone deliberately
+# adds it below.
+_PUBLIC_EXACT = frozenset({"/", "/index.html", "/favicon.ico", "/robots.txt"})
+_PUBLIC_PREFIXES = ("/assets/",)
+
+
+def _is_public_path(path: str) -> bool:
+    return path in _PUBLIC_EXACT or path.startswith(_PUBLIC_PREFIXES)
 
 
 class _TokenAuthMiddleware:
-    """Raw ASGI middleware enforcing the API token on /api/* and /ws/* paths.
+    """Raw ASGI middleware enforcing the API token on every non-public path.
 
     Deliberately NOT a FastAPI/Starlette Depends()-based check: this project
     has ~25 REST routes plus WebSocket routes defined directly on `app`, and
     a dependency would need to be threaded through every single one (easy to
-    miss on a future route). A path-prefix ASGI wrapper covers all current
-    and future /api/ and /ws/ routes uniformly, including WebSocket upgrades,
-    without touching route bodies. Static assets and the SPA shell (outside
-    /api and /ws) stay public — the browser needs to load the UI before it
-    can do anything with a token.
+    miss on a future route). An ASGI wrapper covers all current and future
+    routes uniformly, including WebSocket upgrades, without touching route
+    bodies.
+
+    Only the handful of paths in _PUBLIC_EXACT / _PUBLIC_PREFIXES stay open —
+    just enough for a browser to load the SPA shell and its bundled assets
+    before it can do anything with a token.
     """
 
     def __init__(self, asgi_app, token: str):
@@ -342,22 +396,23 @@ class _TokenAuthMiddleware:
             return await self._app(scope, receive, send)
 
         path = scope.get("path", "")
-        if not (path.startswith("/api/") or path.startswith("/ws/")):
+        if _is_public_path(path):
             return await self._app(scope, receive, send)
 
         provided = None
         for k, v in scope.get("headers") or []:
-            if k == b"authorization" and v.startswith(b"Bearer "):
+            if k.lower() == b"authorization" and v.startswith(b"Bearer "):
                 provided = v[len(b"Bearer "):].decode("utf-8", "ignore")
                 break
         if provided is None:
             # Browsers can't set custom headers during the WebSocket
             # handshake — accept the token as a query parameter for ws/ paths.
-            qs = scope.get("query_string", b"").decode("utf-8", "ignore")
-            for part in qs.split("&"):
-                if part.startswith("token="):
-                    provided = part[len("token="):]
-                    break
+            # parse_qs handles percent-encoding, which manual splitting did not.
+            from urllib.parse import parse_qs
+            qs = parse_qs(scope.get("query_string", b"").decode("utf-8", "ignore"))
+            token_vals = qs.get("token")
+            if token_vals:
+                provided = token_vals[0]
 
         if provided is None or not hmac.compare_digest(provided, self._token):
             if scope["type"] == "websocket":
@@ -864,41 +919,17 @@ async def api_limits_update(req: LimitsRequest, gpu_index: int = 0):
     gpu = g_state["gpu"]
     errs = []
 
-    if req.power_limit_w is not None:
-        power_info = await _run(get_power_limit, gpu_index)
-        min_w, max_w = power_info.get("min_power_limit_w"), power_info.get("max_power_limit_w")
-        if min_w is not None and max_w is not None and not (min_w <= req.power_limit_w <= max_w):
-            raise HTTPException(
-                status_code=400,
-                detail=f"power_limit_w {req.power_limit_w} is outside the driver's "
-                       f"reported range ({min_w}-{max_w} W)",
-            )
-
-    if req.mem_offset_mhz is not None:
-        mem_range = await _run(get_mem_offset_range, gpu_index)
-        min_off, max_off = mem_range.get("min_mem_offset_mhz"), mem_range.get("max_mem_offset_mhz")
-        if min_off is not None and max_off is not None and not (min_off <= req.mem_offset_mhz <= max_off):
-            raise HTTPException(
-                status_code=400,
-                detail=f"mem_offset_mhz {req.mem_offset_mhz} is outside the driver's "
-                       f"reported range ({min_off}-{max_off} MHz)",
-            )
-
-    if (
-        req.mem_locked_max_mhz is not None
-        and req.mem_locked_min_mhz is not None
-        and req.mem_locked_min_mhz > req.mem_locked_max_mhz
-    ):
-        # The driver snaps an out-of-range single value to its nearest
-        # supported clock rather than erroring (see hal/limits.py's
-        # get_current_mem_clock() docstring), so a full min/max bounds check
-        # here would just duplicate that silently-permissive behavior. An
-        # inverted min > max is unambiguously a caller mistake, though.
-        raise HTTPException(
-            status_code=400,
-            detail=f"mem_locked_min_mhz ({req.mem_locked_min_mhz}) is greater than "
-                   f"mem_locked_max_mhz ({req.mem_locked_max_mhz})",
-        )
+    # Shared with profiles/apply.py — see safety.validate_limits().
+    limit_errs = await _run(
+        validate_limits,
+        gpu_index,
+        req.power_limit_w,
+        req.mem_offset_mhz,
+        req.mem_locked_min_mhz,
+        req.mem_locked_max_mhz,
+    )
+    if limit_errs:
+        raise HTTPException(status_code=400, detail="; ".join(limit_errs))
 
     if req.power_limit_w is not None:
         ok, msg = await _run(set_power_limit, req.power_limit_w, gpu_index)
@@ -1363,6 +1394,32 @@ _dist_dir = str(_dist_dir)
 if os.path.isdir(os.path.join(_dist_dir, "assets")):
     app.mount("/assets", StaticFiles(directory=os.path.join(_dist_dir, "assets")), name="assets")
 
+
+def _resolve_under_dist(dist_root: Path, rel: str) -> Path | None:
+    """Resolve `rel` beneath `dist_root`, or return None if it escapes.
+
+    SECURITY: `rel` comes straight from the URL path and is already
+    percent-decoded by the ASGI server, so it can contain "..", absolute
+    paths, or symlink components. A bare os.path.join() therefore lets a
+    request like  GET /..%2f..%2f..%2fetc%2fshadow  walk out of the frontend
+    directory, and this process runs as root — that made the SPA route an
+    arbitrary-file-read primitive.
+
+    Both sides are resolved (which follows symlinks) before the containment
+    check, so neither ".." segments nor a symlink planted inside dist/ can
+    point outside the tree.
+    """
+    if not rel:
+        return None
+    try:
+        target = (dist_root / rel).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if target == dist_root or dist_root not in target.parents:
+        return None
+    return target
+
+
 @app.get("/{catchall:path}")
 async def serve_spa(catchall: str):
     if catchall.startswith("api/") or catchall.startswith("ws/"):
@@ -1371,12 +1428,14 @@ async def serve_spa(catchall: str):
     if not os.path.isdir(_dist_dir):
         return {"error": "Frontend not built. Run pnpm build in frontend/."}
 
-    path = os.path.join(_dist_dir, catchall)
-    if os.path.isfile(path) and catchall:
-        return FileResponse(path)
+    dist_root = Path(_dist_dir).resolve()
 
-    index = os.path.join(_dist_dir, "index.html")
-    if os.path.isfile(index):
+    target = _resolve_under_dist(dist_root, catchall)
+    if target is not None and target.is_file():
+        return FileResponse(target)
+
+    index = dist_root / "index.html"
+    if index.is_file():
         return FileResponse(index)
 
     raise HTTPException(status_code=404, detail="Not Found")

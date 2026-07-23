@@ -42,7 +42,7 @@ def apply_profile(gpu_index: int, name: str, cfg) -> tuple[list[str], list[str]]
     from ..hal.limits import set_power_limit, set_mem_locked_clocks, set_clock_offsets
     from ..hal.vfcurve import write_offsets, reset_offsets
     from ..hal.snapshot import save as snapshot_save
-    from ..safety import validate_write
+    from ..safety import validate_write, validate_limits
 
     safe_name = "".join(c for c in name if c.isalnum() or c in " _-()").strip()
     filepath = os.path.join(cfg.profile_dir, f"{safe_name}.json")
@@ -52,6 +52,33 @@ def apply_profile(gpu_index: int, name: str, cfg) -> tuple[list[str], list[str]]
 
     critical_errs: list[str] = []
     warnings: list[str] = []
+
+    # Bounds-check the secondary settings against the driver's reported
+    # ranges before touching hardware. This path (CLI `profile apply`, daemon
+    # autoload, and root_helper's apply_gpu_offsets) previously fed
+    # power_limit_w / mem_offset_mhz / mem_locked_* straight into NVML with no
+    # validation, while /api/limits checked the identical fields — meaning a
+    # profile file was a way to bypass those checks entirely. Treated as
+    # warnings, not critical errors, to match how a rejected secondary
+    # setting is handled everywhere else in this function.
+    limit_errs = validate_limits(
+        gpu_index,
+        power_limit_w=profile.power_limit_w,
+        mem_offset_mhz=profile.mem_offset_mhz,
+        mem_locked_min_mhz=profile.mem_locked_min_mhz,
+        mem_locked_max_mhz=profile.mem_locked_max_mhz,
+    )
+    if limit_errs:
+        warnings.extend(f"Rejected: {e}" for e in limit_errs)
+        # Drop the offending values so the rest of the profile still applies.
+        rejected = " ".join(limit_errs)
+        if "power_limit_w" in rejected:
+            profile.power_limit_w = None
+        if "mem_offset_mhz" in rejected:
+            profile.mem_offset_mhz = None
+        if "mem_locked" in rejected:
+            profile.mem_locked_min_mhz = None
+            profile.mem_locked_max_mhz = None
 
     # Order matters here: LACT's nvidia backend (a comparable NVML-based tool)
     # always sets locked clocks *before* the offset, and resets them in the

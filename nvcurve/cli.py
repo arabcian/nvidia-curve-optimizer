@@ -452,7 +452,23 @@ def _safe_host(host: str, cfg: Config) -> str:
 
 
 def _log_file() -> str:
-    return "/var/log/nvcurve.log" if os.geteuid() == 0 else "/tmp/nvcurve.log"
+    """Path for the detached server's log.
+
+    The non-root branch used to return a fixed /tmp/nvcurve.log — a
+    predictable name in a world-writable directory, which another local user
+    can pre-create as a symlink. Every current caller runs after
+    require_root(), so that branch is unreachable today, but the safe path
+    shouldn't depend on that staying true. Fall back to a per-user directory.
+    """
+    if os.geteuid() == 0:
+        return "/var/log/nvcurve.log"
+    cache_dir = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    target = os.path.join(cache_dir, "nvcurve")
+    try:
+        os.makedirs(target, mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+    return os.path.join(target, "nvcurve.log")
 
 
 def _read_server_info() -> dict | None:
@@ -920,10 +936,26 @@ def _persistent_cfg_load() -> dict:
 
 
 def _persistent_cfg_save(data: dict) -> None:
-    """Write /etc/nvcurve/config.json, creating the parent directory if needed."""
-    os.makedirs(os.path.dirname(_PERSISTENT_CONFIG_FILE), exist_ok=True)
+    """Write /etc/nvcurve/config.json, creating the parent directory if needed.
+
+    Modes are set explicitly: this file is read by the root daemon to decide
+    which profiles to auto-apply and where profile_dir/snapshot_dir live, so
+    it must never end up group- or world-writable because of an inherited
+    umask (`sudo` passes the caller's umask through).
+    """
+    cfg_dir = os.path.dirname(_PERSISTENT_CONFIG_FILE)
+    os.makedirs(cfg_dir, exist_ok=True)
+    try:
+        os.chmod(cfg_dir, 0o755)
+    except OSError:
+        pass
+
     with open(_PERSISTENT_CONFIG_FILE, "w") as f:
         json.dump(data, f, indent=2)
+    try:
+        os.chmod(_PERSISTENT_CONFIG_FILE, 0o644)
+    except OSError:
+        pass
 
 
 def _profile_config_read() -> dict:
@@ -1281,6 +1313,21 @@ def cmd_setup(args):
         print(f"  FAILED to read state before write: {err}", file=sys.stderr)
         sys.exit(1)
 
+    # Same safety gate every other write path goes through. This call site
+    # was previously the one exception — `--point`/`--delta` went straight to
+    # write_offsets() unvalidated, so e.g. a negative --point silently
+    # corrupted unrelated bytes of the ClockBoostTable struct.
+    from .safety import validate_write
+    setup_errors = validate_write({verify_point: verify_delta_khz}, default_config.max_delta_khz)
+    if setup_errors:
+        for e in setup_errors:
+            print(f"  {e}", file=sys.stderr)
+        print()
+        print(sep)
+        print("  RESULT: Refusing to run write-verify with unsafe parameters.")
+        print(sep)
+        sys.exit(1)
+
     full_mask = getattr(args, "full_mask", False)
     ret, desc = write_offsets(gpu, {verify_point: verify_delta_khz}, full_mask=full_mask)
     if ret != 0:
@@ -1618,7 +1665,9 @@ def _cmd_serve_start(args, cfg: Config, open_browser: bool = False) -> None:
             cmd += ["--gpu", str(args.gpu_index)]
         log_path = _log_file()
         print("Starting nvcurve server in background...")
-        with open(log_path, "a") as lf:
+        # O_NOFOLLOW: never append through a symlink planted at log_path.
+        log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o640)
+        with os.fdopen(log_fd, "a") as lf:
             p = subprocess.Popen(cmd, stdout=lf, stderr=lf, start_new_session=True)
         print(f"Server starting (PID {p.pid}). Logs: {log_path}")
         if open_browser:

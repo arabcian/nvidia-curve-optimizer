@@ -18,10 +18,12 @@ and root_helper.py + the nvcurve/ package installed alongside this
 file (see install.sh).
 """
 
+import fcntl
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
 from PySide6.QtCore import Qt, QTimer, Signal, QThread, QPointF, QMargins
@@ -231,45 +233,78 @@ AUTOSTART_FILE = os.path.join(AUTOSTART_DIR, "nvcurve-gui.desktop")
 # clicking from queueing many privileged operations back to back.
 TRAY_APPLY_COOLDOWN_MS = 3000
 
-# Single-instance guard: a QLocalServer listening on this name acts as a
-# lock. A second launch connects as a client, asks the first instance to
-# raise its window, and exits immediately instead of running a duplicate
-# GUI (which would fight over the same GPU/root_helper state).
+# The tray/status-notifier host isn't always ready the instant this
+# process starts (notably right after login via --tray autostart, before
+# the panel has finished registering). Retry isSystemTrayAvailable() for
+# up to ~6s (15 * 400ms) before permanently giving up on the tray.
+TRAY_SETUP_RETRY_MS = 400
+TRAY_SETUP_MAX_RETRIES = 15
+
+# Single-instance guard.
+#
+# Acquisition uses a plain OS-level flock() on a lock file — no Qt
+# involved at all — so it can run before QApplication even exists and
+# can never interfere with the platform plugin's native setup (X11/
+# Wayland tray & status-notifier registration happens very early and is
+# sensitive to what else touches native sockets/event processing at
+# that moment). Only *after* the window and tray are fully set up do we
+# open a QLocalServer, purely so later launches have something to ping
+# to raise the existing window — that IPC channel is never involved in
+# deciding who the primary instance is.
 SINGLE_INSTANCE_KEY = "nvcurve-gui-single-instance"
+SINGLE_INSTANCE_LOCK_PATH = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(),
+    "nvcurve-gui.lock",
+)
 
 
 class SingleInstanceGuard:
     """Ensures only one nvcurve-gui process runs per user session.
 
-    Uses a QLocalServer as a named lock. If binding succeeds, this is the
-    first (primary) instance, and later launches' "show yourself" pings
-    are received here and forwarded to raise the existing window. If
-    binding fails, another instance already owns the lock: we ping it
-    (so it can raise its window) and the caller should exit.
+    try_acquire() is pure OS-level file locking (fcntl.flock), safe to
+    call before QApplication is constructed. start_ipc_server() opens
+    the QLocalServer used to let later launches ping this one to raise
+    its window — call it only once the window/tray are already set up.
     """
 
-    def __init__(self, key=SINGLE_INSTANCE_KEY):
+    def __init__(self, key=SINGLE_INSTANCE_KEY, lock_path=SINGLE_INSTANCE_LOCK_PATH):
         self._key = key
+        self._lock_path = lock_path
+        self._lock_file = None
         self.server = None
 
     def try_acquire(self):
-        """Returns True if this process is the primary instance."""
-        # First check whether a server is genuinely alive at this name —
-        # only remove the socket file if nothing answers, since a crashed
-        # instance can leave a stale file behind, but a live instance
-        # must not have its lock ripped out from under it.
-        probe = QLocalSocket()
-        probe.connectToServer(self._key)
-        if probe.waitForConnected(200):
-            probe.disconnectFromServer()
+        """Returns True if this process is the primary instance. Holds
+        the lock file open (and thus locked) for the life of the
+        process; the OS releases it automatically on exit or crash, so
+        there's no stale-lock cleanup to worry about."""
+        try:
+            self._lock_file = open(self._lock_path, "w")
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            if self._lock_file is not None:
+                self._lock_file.close()
+                self._lock_file = None
             return False
+        return True
+
+    def start_ipc_server(self):
+        """Open the "raise my window" IPC channel. Call only after the
+        window and tray are fully initialized (or have given up trying),
+        so this never runs during the timing-sensitive early startup
+        window."""
         QLocalServer.removeServer(self._key)
         server = QLocalServer()
         server.setSocketOptions(QLocalServer.UserAccessOption)
         if server.listen(self._key):
             self.server = server
-            return True
-        return False
+        else:
+            print(
+                f"nvcurve-gui: warning: could not start single-instance "
+                f"IPC server ({server.errorString()}); a second launch "
+                f"won't be able to raise this window.",
+                file=sys.stderr,
+            )
 
     def notify_running_instance(self):
         """Ping the primary instance to ask it to raise its window."""
@@ -694,7 +729,8 @@ class NVCurveWindow(QMainWindow):
         """Wire the primary instance's QLocalServer to raise this window
         whenever a second launch pings it instead of starting its own GUI."""
         self._single_instance_guard = guard
-        guard.server.newConnection.connect(self._on_single_instance_ping)
+        if guard.server is not None:
+            guard.server.newConnection.connect(self._on_single_instance_ping)
 
     def _on_single_instance_ping(self):
         server = self._single_instance_guard.server
@@ -705,13 +741,16 @@ class NVCurveWindow(QMainWindow):
     def _raise_from_second_instance(self, conn):
         conn.readAll()  # drain the "raise" payload
         conn.disconnectFromServer()
-        if self.isHidden():
+        was_hidden = self.isHidden()
+        if was_hidden:
             self.show()
         self.setWindowState(
             (self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive
         )
         self.raise_()
         self.activateWindow()
+        if was_hidden:
+            self._read_gpu_curve()
 
     # ─── Logging ─────────────────────────────────────────────────────
     def _log(self, text):
@@ -1776,19 +1815,69 @@ class NVCurveWindow(QMainWindow):
         """Themed tray icon — see module-level _build_icon_pixmap()."""
         return QIcon(_build_icon_pixmap(64))
 
-    def _setup_tray(self):
+    def _setup_tray(self, attempt=0):
+        # The desktop's tray/status-notifier host isn't always ready the
+        # instant this process starts — this is especially common right
+        # after login when launched via --tray autostart, before the
+        # panel/status-area has finished registering with the session.
+        # A one-shot isSystemTrayAvailable() check at that moment can
+        # come back False even though the tray is about to be available
+        # a moment later. Retry for a few seconds before actually giving
+        # up, instead of permanently disabling the tray for the rest of
+        # this process's life.
         if not QSystemTrayIcon.isSystemTrayAvailable():
+            if attempt < TRAY_SETUP_MAX_RETRIES:
+                QTimer.singleShot(
+                    TRAY_SETUP_RETRY_MS,
+                    lambda: self._setup_tray(attempt + 1),
+                )
+                return
+            msg = (
+                "nvcurve-gui: system tray never became available after "
+                f"{TRAY_SETUP_MAX_RETRIES} retries "
+                f"({TRAY_SETUP_RETRY_MS * TRAY_SETUP_MAX_RETRIES}ms) — "
+                "close-to-tray disabled. If your desktop environment does "
+                "have a tray/status area, this usually means it doesn't "
+                "support the legacy tray protocol Qt uses here (e.g. "
+                "GNOME on Wayland without an AppIndicator extension)."
+            )
+            # Printed to stderr (not just self._log's in-window widget)
+            # because with --tray the window — and its log — stays
+            # hidden, so this would otherwise be invisible.
+            print(msg, file=sys.stderr)
             self._log("ℹ️ System tray not available; close-to-tray disabled.")
+            # We never got a tray, so if this was a --tray (autostart)
+            # launch that's been sitting hidden waiting for the tray,
+            # show the window now rather than leaving the app invisible
+            # with no way to reach it.
+            if "--tray" in sys.argv and self.isHidden():
+                self.show()
             return
-        icon = self._make_tray_icon()
-        self.setWindowIcon(icon)
-        self.tray_icon = QSystemTrayIcon(icon, self)
-        self.tray_icon.setToolTip("nvcurve-gui — GPU V/F Curve Tuning")
-        self.tray_menu = QMenu()
-        self.tray_icon.setContextMenu(self.tray_menu)
-        self.tray_icon.activated.connect(self._on_tray_activated)
-        self._rebuild_tray_menu()
-        self.tray_icon.show()
+        try:
+            if attempt > 0:
+                print(
+                    f"nvcurve-gui: system tray became available after "
+                    f"{attempt} retr{'y' if attempt == 1 else 'ies'}.",
+                    file=sys.stderr,
+                )
+            icon = self._make_tray_icon()
+            self.setWindowIcon(icon)
+            self.tray_icon = QSystemTrayIcon(icon, self)
+            self.tray_icon.setToolTip("nvcurve-gui — GPU V/F Curve Tuning")
+            self.tray_menu = QMenu()
+            self.tray_icon.setContextMenu(self.tray_menu)
+            self.tray_icon.activated.connect(self._on_tray_activated)
+            self._rebuild_tray_menu()
+            self.tray_icon.show()
+        except Exception as e:
+            # A failure here would otherwise vanish silently (this runs
+            # during __init__, well before the log widget is visible in
+            # --tray mode) and leave tray_icon as None with no clue why.
+            print(f"nvcurve-gui: tray icon setup failed: {e}", file=sys.stderr)
+            self._log(f"⚠️ Tray icon setup failed: {e}")
+            self.tray_icon = None
+            if "--tray" in sys.argv and self.isHidden():
+                self.show()
 
     def _rebuild_tray_menu(self):
         """(Re)populate the tray right-click menu with the saved profiles."""
@@ -1818,6 +1907,10 @@ class NVCurveWindow(QMainWindow):
             none_act.setEnabled(False)
 
         self.tray_menu.addSeparator()
+        reset_act = self.tray_menu.addAction("↺ Reset Curve")
+        reset_act.triggered.connect(self._reset_gpu_curve)
+
+        self.tray_menu.addSeparator()
         show_act = self.tray_menu.addAction("Show window")
         show_act.triggered.connect(self._restore_from_tray)
         quit_act = self.tray_menu.addAction("Quit")
@@ -1835,10 +1928,20 @@ class NVCurveWindow(QMainWindow):
         self.showNormal()
         self.raise_()
         self.activateWindow()
+        # The curve on the GPU may have changed since this window was
+        # last visible (a profile applied from the tray menu, another
+        # tool, a driver/session reset, etc.) — refresh from hardware
+        # instead of showing whatever was last computed while hidden.
+        self._read_gpu_curve()
 
     def _quit_from_tray(self):
         self._force_quit = True
         self.close()
+        # setQuitOnLastWindowClosed(False) is set so the X button can hide
+        # to the tray instead of quitting — but that also means closing
+        # the window here does NOT stop the event loop on its own. Quit
+        # explicitly, or the process just keeps running invisibly.
+        QApplication.instance().quit()
 
     def _tray_apply_profile(self, name):
         """Apply a saved profile from the tray, with a busy + cooldown guard
@@ -2058,15 +2161,20 @@ def _make_app_icon():
 
 
 def main():
+    # Single-instance check happens FIRST, before QApplication or any Qt
+    # object exists at all — this is plain OS file locking, so it can
+    # never interfere with the platform plugin's native startup (which
+    # is what handles X11/Wayland tray & status-notifier registration).
+    guard = SingleInstanceGuard()
+    is_primary = guard.try_acquire()
+
     app = QApplication(sys.argv)
     app.setApplicationName("nvcurve-gui")
 
-    # Single-instance guard: if another nvcurve-gui is already running,
-    # ping it to raise its window and exit instead of starting a second
-    # GUI on top of the same GPU/root_helper state.
-    guard = SingleInstanceGuard()
-    is_primary = guard.try_acquire()
     if not is_primary:
+        # Another instance is already running — ask it to raise its
+        # window and exit. We still need a QApplication just to run the
+        # local-socket ping below.
         guard.notify_running_instance()
         return
 
@@ -2074,15 +2182,23 @@ def main():
     # Hiding the window to the tray must not quit the app.
     app.setQuitOnLastWindowClosed(False)
     win = NVCurveWindow()
-    win.attach_single_instance_guard(guard)
     win.setWindowIcon(_make_app_icon())
     app.setWindowIcon(win.windowIcon())
-    # --tray (autostart on login): start hidden in the tray. If the tray
-    # isn't available, fall back to showing the window normally.
-    if "--tray" in sys.argv and win.tray_icon is not None:
-        pass  # stay hidden; tray icon is already visible
-    else:
+    # --tray (autostart on login): start hidden and let _setup_tray()'s
+    # retry loop decide. It keeps the window hidden while the tray is
+    # still becoming available, and only calls win.show() itself as a
+    # last resort if the tray never shows up after retrying. Deciding
+    # this here instead, right after construction, would race with
+    # those retries and could show the window even though the tray
+    # ends up available a moment later.
+    if "--tray" not in sys.argv:
         win.show()
+
+    # Only now — window constructed, tray attempted — open the "raise my
+    # window" IPC channel for future launches to ping.
+    guard.start_ipc_server()
+    win.attach_single_instance_guard(guard)
+
     sys.exit(app.exec())
 
 

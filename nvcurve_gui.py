@@ -1036,8 +1036,6 @@ class NVCurveWindow(QMainWindow):
             self._point_offsets[i] = int(offset)
 
         self._recompute_display()
-        self._read_offsets = self._point_offsets.copy()
-        self._read_core_offset = self._core_offset
 
     def _on_flatten_entered(self):
         val = self.limit_spin.value()
@@ -1317,8 +1315,12 @@ class NVCurveWindow(QMainWindow):
         self.vram_lock_min_spin.blockSignals(False)
         self.vram_lock_max_spin.blockSignals(False)
 
-        self._read_core_offset = self._core_offset
-        self._read_offsets = self._point_offsets.copy() if self._point_offsets else {}
+        # NOTE: intentionally NOT touching self._read_offsets /
+        # self._read_core_offset here — those represent the last value
+        # actually read from the GPU hardware, and must stay untouched
+        # by loading a profile into the UI. Otherwise "Reset Graph"
+        # would revert to this profile's data instead of real hardware
+        # state.
 
         self._flatten_threshold = -1
         self.limit_spin.blockSignals(True)

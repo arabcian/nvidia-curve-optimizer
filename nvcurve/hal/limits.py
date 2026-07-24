@@ -64,10 +64,17 @@ def _ensure_nvml_init() -> None:
     try:
         pynvml.nvmlInit()
         _nvml_initialized = True
+        _handle_cache.clear()
     except Exception as exc:
         # Leave the flag False so the next call retries; the actual NVML
         # call below will surface a clearer error if init is truly broken.
         log.debug("_ensure_nvml_init: %s", exc)
+
+
+# NVML device handles are stable for the life of an nvmlInit() session, but
+# every call below re-resolved one. The monitor poller alone did this several
+# times a second, per GPU, forever.
+_handle_cache: dict[int, object] = {}
 
 
 def _get_handle(gpu_index: int):
@@ -75,7 +82,17 @@ def _get_handle(gpu_index: int):
     if not _NVML_AVAILABLE:
         raise RuntimeError("NVML not available (install nvidia-ml-py)")
     _ensure_nvml_init()
-    return pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
+    cached = _handle_cache.get(gpu_index)
+    if cached is not None:
+        return cached
+    handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
+    _handle_cache[gpu_index] = handle
+    return handle
+
+
+def invalidate_handle_cache() -> None:
+    """Drop cached NVML handles — call after nvmlShutdown()."""
+    _handle_cache.clear()
 
 
 # ── Power limit ───────────────────────────────────────────────────────────────
@@ -114,10 +131,19 @@ def set_power_limit(limit_w: int, gpu_index: int = 0) -> tuple[bool, str]:
     except Exception as exc:
         log.debug("NVML set_power_limit failed: %s — falling back to nvidia-smi", exc)
 
-    ret = subprocess.run(
-        ["nvidia-smi", "-i", str(gpu_index), "-pl", str(limit_w)],
-        capture_output=True, text=True,
-    )
+    # This fallback runs inside the API server's thread pool and inside the
+    # boot-time autoload path. An unbounded subprocess.run() there means a
+    # wedged nvidia-smi (a hung driver is exactly when this fallback fires)
+    # blocks that worker forever with no way to recover.
+    try:
+        ret = subprocess.run(
+            ["nvidia-smi", "-i", str(gpu_index), "-pl", str(limit_w)],
+            capture_output=True, text=True, timeout=15,
+        )
+    except FileNotFoundError:
+        return False, "NVML rejected the power limit and nvidia-smi is not installed"
+    except subprocess.TimeoutExpired:
+        return False, "nvidia-smi timed out after 15s while setting the power limit"
     if ret.returncode == 0:
         return True, "OK"
     return False, ret.stderr.strip() or ret.stdout.strip()

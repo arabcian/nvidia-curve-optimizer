@@ -245,9 +245,19 @@ async def _handle_client(
 def _load_persistent_config() -> dict:
     try:
         with open(_PERSISTENT_CONFIG_FILE) as f:
-            return json.load(f)
-    except Exception:
+            data = json.load(f)
+    except FileNotFoundError:
         return {}
+    except Exception as exc:
+        # Log it. Returning {} silently made a corrupt config look exactly
+        # like a missing one, so the daemon would boot with auto-load
+        # disabled and never say why.
+        log.warning("Could not read %s: %s", _PERSISTENT_CONFIG_FILE, exc)
+        return {}
+    if not isinstance(data, dict):
+        log.warning("%s is not a JSON object — ignoring", _PERSISTENT_CONFIG_FILE)
+        return {}
+    return data
 
 
 def run() -> None:
@@ -267,14 +277,32 @@ def run() -> None:
 
     from .config import Config
     _cfg = Config()
-    for key in ("max_delta_khz", "auto_snapshot", "max_snapshots",
-                "snapshot_dir", "profile_dir", "host", "port"):
-        if key in cfg_data:
-            setattr(_cfg, key, cfg_data[key])
+    # Type-check what comes out of the file: `port` arriving as a string
+    # (a hand-edited config) propagated all the way into the bind call and
+    # failed there with an opaque error instead of here with a clear one.
+    _expected = {
+        "max_delta_khz": int, "auto_snapshot": bool, "max_snapshots": int,
+        "snapshot_dir": str, "profile_dir": str, "host": str, "port": int,
+    }
+    for key, expected_type in _expected.items():
+        if key not in cfg_data:
+            continue
+        value = cfg_data[key]
+        if expected_type is int and isinstance(value, bool):
+            log.warning("Config key %r must be an int — ignoring", key)
+            continue
+        if not isinstance(value, expected_type):
+            log.warning("Config key %r must be %s, got %s — ignoring",
+                        key, expected_type.__name__, type(value).__name__)
+            continue
+        setattr(_cfg, key, value)
 
     # Apply auto-load profiles in a subprocess so the daemon process itself
     # never loads NvAPI/NVML/HAL modules — keeps steady-state RSS low.
-    auto_load_profiles: dict = cfg_data.get("auto_load_profiles", {})
+    auto_load_profiles = cfg_data.get("auto_load_profiles", {})
+    if not isinstance(auto_load_profiles, dict):
+        log.warning("Config key 'auto_load_profiles' must be an object — ignoring")
+        auto_load_profiles = {}
     if auto_load_profiles:
         log.info("Applying auto-load profiles…")
         subprocess.run(

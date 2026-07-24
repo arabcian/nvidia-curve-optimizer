@@ -21,20 +21,29 @@ def init_nvapi() -> None:
         raise NvApiUnavailableError("NvAPI_Initialize failed")
 
 
+# NvAPI's own documented ceiling for NvAPI_EnumPhysicalGPUs.
+_MAX_PHYSICAL_GPUS = 64
+
+
 def enumerate_gpus() -> tuple[ctypes.Array, int]:
     """Return (gpu_handles_array, count).
 
     Raises NvApiUnavailableError if the enumeration call itself fails, or
     NoGpuFoundError if it succeeds but reports zero GPUs.
     """
-    gpus = (ctypes.c_void_p * 64)()
+    gpus = (ctypes.c_void_p * _MAX_PHYSICAL_GPUS)()
     ngpu = ctypes.c_int32()
     ret = query_interface(FUNC["EnumPhysicalGPUs"])(ctypes.byref(gpus), ctypes.byref(ngpu))
     if ret != 0:
         raise NvApiUnavailableError(f"EnumPhysicalGPUs failed (code {ret})")
     if ngpu.value == 0:
         raise NoGpuFoundError("No NVIDIA GPUs found")
-    return gpus, ngpu.value
+    # Never report more handles than the array we actually gave the driver.
+    # A count larger than the buffer (a driver bug, or a future NvAPI that
+    # raises the limit) would otherwise let callers index past the end of
+    # `gpus` and hand an uninitialised pointer to the driver.
+    count = min(ngpu.value, _MAX_PHYSICAL_GPUS)
+    return gpus, count
 
 
 def get_gpu_name(gpu) -> str:
@@ -105,8 +114,14 @@ def get_gpu(index: int = 0):
     Returns (handle, name).
     """
     init_nvapi()
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise GpuIndexError(f"GPU index must be an int, got {type(index).__name__}")
     gpus, count = enumerate_gpus()
-    if index >= count:
+    # `index < 0` was previously accepted: Python's negative indexing turned
+    # `gpus[-1]` into the *last slot of the 64-entry array*, which the driver
+    # never populated. That handed a NULL/uninitialised handle to every
+    # subsequent NvAPI call instead of raising a clear error.
+    if index < 0 or index >= count:
         raise GpuIndexError(f"GPU index {index} out of range (found {count} GPU(s))")
     gpu = gpus[index]
     name = get_gpu_name(gpu)

@@ -18,9 +18,9 @@ Invoked as: pkexec /path/to/root_helper.py   (JSON payload on stdin)
 
 import json
 import os
-import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path as _Path
 
 # Only ever add this process's own install directory to sys.path/PYTHONPATH
@@ -36,6 +36,13 @@ NVCURVE_PROJECT_DIR = _HELPER_DIR
 
 # ─── Fixed, FHS-friendly paths ──────────────────────────────────────────
 NVCURVE_PROFILES_DIR = "/etc/nvcurve/profiles"
+
+# Point index range used for the "reset to a known baseline before applying"
+# step. 132 is the last point on the GPU this was developed against; `nvcurve
+# write` clamps to the real point count, so a GPU with fewer points is
+# handled, but this stays a hardcoded assumption worth revisiting if the tool
+# is ever run on a card with more.
+RESET_POINT_RANGE = "0-132"
 NVCURVE_CONFIG_PATH = "/etc/nvcurve/config.json"
 
 # Result files are written here (root-owned tmpfs dir) instead of /tmp to
@@ -45,7 +52,38 @@ GPU_READ_RESULT = "/run/nvcurve-gui/nvcurve_read.json"
 GPU_APPLY_RESULT = "/run/nvcurve-gui/nvcurve_apply_result.json"
 GPU_RESET_RESULT = "/run/nvcurve-gui/nvcurve_reset_result.json"
 
-PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Deliberately NOT a copy of nvcurve.profiles.native.safe_profile_name()'s
+# *sanitiser* — this is the privileged boundary, so it validates instead of
+# rewriting: a name that the sanitiser would silently change is rejected
+# outright rather than quietly redirected at a different file.
+#
+# The character set does now match native.py's ("A-Za-z0-9", space,
+# underscore, hyphen, parentheses, plus Unicode letters/digits via
+# str.isalnum). It previously did not: this regex refused spaces and
+# parentheses that the server and CLI both accepted, so a profile named
+# e.g. "Silent (UV)" saved fine from the CLI and then failed with
+# "Invalid profile name" for every GUI operation on it.
+PROFILE_NAME_MAX_LEN = 64
+_PROFILE_NAME_EXTRA = " _-()"
+
+
+def _canonical_profile_name(name) -> str:
+    if not isinstance(name, str):
+        return ""
+    cleaned = "".join(
+        c for c in name if c.isalnum() or c in _PROFILE_NAME_EXTRA
+    ).strip()
+    return cleaned[:PROFILE_NAME_MAX_LEN].strip()
+
+
+def _valid_profile_name(name) -> bool:
+    """True only for a name that is already in canonical, on-disk form.
+
+    Rejecting non-canonical input (rather than canonicalising it here) means
+    the caller can never be surprised by which file was actually touched.
+    """
+    canonical = _canonical_profile_name(name)
+    return bool(canonical) and canonical == name
 MAX_PROFILE_BYTES = 256 * 1024  # 256 KB
 MAX_STDIN_BYTES = 1024 * 1024  # 1 MB — generous headroom over MAX_PROFILE_BYTES
 
@@ -98,7 +136,7 @@ def _validate_profile_data(data: dict) -> str:
             if not (lo <= value <= hi):
                 return f"field {key!r} value {value} outside plausible range ({lo}..{hi})"
 
-    if isinstance(data.get("name"), str) and not PROFILE_NAME_RE.match(data["name"]):
+    if "name" in data and data["name"] is not None and not _valid_profile_name(data["name"]):
         return "profile_data 'name' field has an invalid name"
 
     deltas = data.get("curve_deltas")
@@ -152,6 +190,35 @@ def _atomic_write_run_json(target_path: str, data) -> None:
         os.chmod(tmp_path, 0o644)
         os.replace(tmp_path, target_path)
     except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_profile(target_path: str, text: str) -> None:
+    """Write `text` to `target_path` atomically, as root, mode 0644.
+
+    The two profile-writing ops used a plain open(path, "w"), which
+    truncates the target before writing anything. /etc/nvcurve/profiles is
+    root-owned 0755 so this was not an attacker-controlled path, but the
+    truncate window is real: a crash or a kill between truncate and write
+    leaves a zero-length profile that the boot-time autoload then fails to
+    parse and skips, silently leaving the GPU at stock. Writing to a fresh
+    temp file in the same directory and rename()ing over the target means a
+    reader sees either the whole old profile or the whole new one.
+    """
+    directory = os.path.dirname(os.path.abspath(target_path))
+    fd, tmp_path = tempfile.mkstemp(prefix=".nvcurve-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, target_path)
+    except BaseException:
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -234,7 +301,7 @@ def op_apply_gpu_offsets(params: dict) -> dict:
     profile_name = params.get("profile_name")
     profile_data = params.get("profile_data")
 
-    if not isinstance(profile_name, str) or not PROFILE_NAME_RE.match(profile_name):
+    if not _valid_profile_name(profile_name):
         return {"ok": False, "error": "Invalid profile name"}
     if not isinstance(profile_data, dict):
         return {"ok": False, "error": "profile_data must be an object"}
@@ -243,9 +310,21 @@ def op_apply_gpu_offsets(params: dict) -> dict:
     schema_err = _validate_profile_data(profile_data)
     if schema_err:
         return {"ok": False, "error": f"Invalid profile_data: {schema_err}"}
+    # The filename comes from profile_name but the *content* carries its own
+    # "name". Letting them disagree meant `nvcurve profile apply <x>` read a
+    # file whose recorded identity was something else entirely — confusing
+    # at best, and a way to make a profile masquerade as another one in any
+    # listing that trusts the field. Pin them together.
+    embedded = profile_data.get("name")
+    if embedded is not None and embedded != profile_name:
+        return {
+            "ok": False,
+            "error": f"profile_data 'name' ({embedded!r}) does not match "
+                     f"profile_name ({profile_name!r})",
+        }
 
     # 1. Reset the curve first so the profile applies cleanly on top.
-    reset_result = _run_nvcurve("write", "--range", "0-132", "--delta", "0")
+    reset_result = _run_nvcurve("write", "--range", RESET_POINT_RANGE, "--delta", "0")
     if reset_result.returncode != 0:
         return {"ok": False, "error": f"Reset failed: {reset_result.stderr.strip()}"}
 
@@ -254,9 +333,7 @@ def op_apply_gpu_offsets(params: dict) -> dict:
     profile_path = os.path.join(NVCURVE_PROFILES_DIR, f"{profile_name}.json")
     if os.path.dirname(os.path.abspath(profile_path)) != os.path.abspath(NVCURVE_PROFILES_DIR):
         return {"ok": False, "error": "Path traversal detected"}
-    with open(profile_path, "w") as f:
-        json.dump(profile_data, f, indent=2)
-    os.chmod(profile_path, 0o644)
+    _atomic_write_profile(profile_path, json.dumps(profile_data, indent=2))
 
     result = _run_nvcurve("profile", "apply", profile_name)
     if result.returncode != 0:
@@ -281,7 +358,7 @@ def op_apply_named_profile(params: dict) -> dict:
     """Apply an already-saved profile by name (no writing of new JSON).
     Used by the tray quick-apply menu and the profile combo."""
     name = params.get("name")
-    if not isinstance(name, str) or not PROFILE_NAME_RE.match(name):
+    if not _valid_profile_name(name):
         return {"ok": False, "error": "Invalid profile name"}
 
     profile_path = os.path.join(NVCURVE_PROFILES_DIR, f"{name}.json")
@@ -291,7 +368,7 @@ def op_apply_named_profile(params: dict) -> dict:
         return {"ok": False, "error": f"Profile not found: {name}"}
 
     # Reset first so the profile applies cleanly on top of a known baseline.
-    reset_result = _run_nvcurve("write", "--range", "0-132", "--delta", "0")
+    reset_result = _run_nvcurve("write", "--range", RESET_POINT_RANGE, "--delta", "0")
     if reset_result.returncode != 0:
         return {"ok": False, "error": f"Reset failed: {reset_result.stderr.strip()}"}
 
@@ -314,7 +391,7 @@ def op_apply_named_profile(params: dict) -> dict:
 
 
 def op_reset_gpu_curve(params: dict) -> dict:
-    reset_proc = _run_nvcurve("write", "--range", "0-132", "--delta", "0")
+    reset_proc = _run_nvcurve("write", "--range", RESET_POINT_RANGE, "--delta", "0")
     if reset_proc.returncode != 0:
         return {"ok": False, "error": f"Reset write failed: {reset_proc.stderr.strip() if reset_proc.stderr else reset_proc.returncode}"}
 
@@ -355,7 +432,7 @@ def op_write_nvcurve_profile(params: dict) -> dict:
     name = params.get("name")
     content = params.get("content")
 
-    if not isinstance(name, str) or not PROFILE_NAME_RE.match(name):
+    if not _valid_profile_name(name):
         return {"ok": False, "error": "Invalid profile name"}
     if not isinstance(content, str):
         return {"ok": False, "error": "content must be a string"}
@@ -371,15 +448,13 @@ def op_write_nvcurve_profile(params: dict) -> dict:
     if os.path.dirname(os.path.abspath(target_path)) != os.path.abspath(NVCURVE_PROFILES_DIR):
         return {"ok": False, "error": "Path traversal detected"}
 
-    with open(target_path, "w") as f:
-        f.write(content)
-    os.chmod(target_path, 0o644)
+    _atomic_write_profile(target_path, content)
     return {"ok": True, "message": f"Profile written: {target_path}"}
 
 
 def op_delete_nvcurve_profile(params: dict) -> dict:
     name = params.get("name")
-    if not isinstance(name, str) or not PROFILE_NAME_RE.match(name):
+    if not _valid_profile_name(name):
         return {"ok": False, "error": "Invalid profile name"}
 
     target_path = os.path.join(NVCURVE_PROFILES_DIR, f"{name}.json")
@@ -421,7 +496,7 @@ def op_set_default_gpu_profile(params: dict) -> dict:
     clear = bool(params.get("clear", False))
 
     if not clear:
-        if not isinstance(name, str) or not PROFILE_NAME_RE.match(name):
+        if not _valid_profile_name(name):
             return {"ok": False, "error": "Invalid profile name"}
         profile_path = os.path.join(NVCURVE_PROFILES_DIR, f"{name}.json")
         if not os.path.isfile(profile_path):
@@ -487,12 +562,18 @@ def main() -> int:
     # it. Pin it here, once, so no individual op has to remember.
     os.umask(0o022)
 
-    raw = sys.stdin.read(MAX_STDIN_BYTES + 1)
-    if len(raw.encode()) > MAX_STDIN_BYTES:
+    # Read from the binary buffer so the cap is measured in the same unit
+    # it is declared in — sys.stdin.read(n) counts *characters*, so a
+    # multi-byte payload could exceed MAX_STDIN_BYTES before the check ran.
+    raw_bytes = sys.stdin.buffer.read(MAX_STDIN_BYTES + 1)
+    if len(raw_bytes) > MAX_STDIN_BYTES:
         print(json.dumps({"ok": False, "error": "stdin payload too large"}))
         return 1
     try:
-        payload = json.loads(raw)
+        payload = json.loads(raw_bytes.decode("utf-8"))
+    except UnicodeDecodeError as e:
+        print(json.dumps({"ok": False, "error": f"stdin is not valid UTF-8: {e}"}))
+        return 1
     except json.JSONDecodeError as e:
         print(json.dumps({"ok": False, "error": f"Invalid JSON on stdin: {e}"}))
         return 1

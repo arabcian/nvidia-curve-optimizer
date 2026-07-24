@@ -198,8 +198,20 @@ def read_clock_entry_full(data: bytes, point: int) -> dict:
     """Extract all 9 raw fields from a single ClockBoostTable entry.
 
     Useful for diagnostics and verifying unknown fields.
+
+    The point index is bounds-checked here rather than trusted: this is
+    reached from `nvcurve inspect`/`read --full` with a user-supplied
+    index, and struct.unpack_from() accepts a negative offset by wrapping
+    to the end of the buffer, so an out-of-range point silently returned
+    fields belonging to a different entry instead of failing.
     """
+    _check_point(point)
     base = CT_BASE + point * CT_STRIDE
+    if base + 9 * 4 > len(data):
+        raise ValueError(
+            f"ClockBoostTable buffer too short for point {point} "
+            f"({len(data)} bytes)"
+        )
     fields = {}
     for j in range(9):
         off = base + j * 4
@@ -327,6 +339,19 @@ def build_write_buffer(
         current_raw, err = read_clock_table_raw(gpu)
         if not current_raw:
             return None, f"Cannot read current ClockBoostTable: {err}"
+
+    # ctypes.memmove() takes a raw length and does NOT bounds-check its
+    # source: if `current_raw` is shorter than CT_SIZE (a short driver
+    # reply, or a caller passing a buffer fetched for a different struct)
+    # this reads past the end of the Python bytes object and copies
+    # whatever heap memory follows it straight into a buffer that is then
+    # handed to SetClockBoostTable. Check the length instead of trusting
+    # every present and future caller of the current_raw parameter.
+    if len(current_raw) < CT_SIZE:
+        return None, (
+            f"ClockBoostTable buffer is {len(current_raw)} bytes, "
+            f"expected at least {CT_SIZE} — refusing to build a write buffer"
+        )
 
     buf = ctypes.create_string_buffer(CT_SIZE)
     ctypes.memmove(buf, current_raw, CT_SIZE)

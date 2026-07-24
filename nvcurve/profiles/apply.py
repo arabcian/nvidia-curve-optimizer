@@ -37,15 +37,16 @@ def apply_profile(gpu_index: int, name: str, cfg) -> tuple[list[str], list[str]]
     both now call this function instead. If you're changing the apply
     order/logic, this is the only place to do it.
     """
-    from .native import load_profile
+    from .native import load_profile, profile_path
     from ..hal.gpu import get_gpu
     from ..hal.limits import set_power_limit, set_mem_locked_clocks, set_clock_offsets
     from ..hal.vfcurve import write_offsets, reset_offsets
     from ..hal.snapshot import save as snapshot_save
     from ..safety import validate_write, validate_limits
 
-    safe_name = "".join(c for c in name if c.isalnum() or c in " _-()").strip()
-    filepath = os.path.join(cfg.profile_dir, f"{safe_name}.json")
+    filepath = profile_path(cfg.profile_dir, name)
+    if filepath is None:
+        raise FileNotFoundError(f"invalid profile name: {name!r}")
 
     profile = load_profile(filepath)  # raises FileNotFoundError if missing
     gpu, gpu_name = get_gpu(index=gpu_index)
@@ -110,7 +111,14 @@ def apply_profile(gpu_index: int, name: str, cfg) -> tuple[list[str], list[str]]
             warnings.append(f"Power limit: {msg}")
 
     if profile.curve_deltas:
-        deltas = {int(k): v for k, v in profile.curve_deltas.items()}
+        # A hand-edited or partially-written profile can carry a key that
+        # isn't an integer string; int(k) then raised ValueError out of the
+        # boot-time autoload path, aborting the whole apply with a traceback
+        # instead of a reported error.
+        try:
+            deltas = {int(k): int(v) for k, v in profile.curve_deltas.items()}
+        except (TypeError, ValueError) as exc:
+            return [f"Curve: malformed curve_deltas in profile {name!r}: {exc}"], warnings
         errors = validate_write(deltas, cfg.max_delta_khz)
         if errors:
             critical_errs.append("Curve: " + "; ".join(errors))
@@ -131,12 +139,14 @@ def apply_profile(gpu_index: int, name: str, cfg) -> tuple[list[str], list[str]]
 
 def apply_with_retry(gpu_index: int, name: str, cfg, max_retries: int = 3) -> bool:
     """Apply a named profile with read-back verification, retrying on mismatch."""
-    from .native import load_profile
+    from .native import load_profile, profile_path
     from ..hal.gpu import get_gpu
     from ..hal.vfcurve import read_clock_offsets
 
-    safe_name = "".join(c for c in name if c.isalnum() or c in " _-()").strip()
-    filepath = os.path.join(cfg.profile_dir, f"{safe_name}.json")
+    filepath = profile_path(cfg.profile_dir, name)
+    if filepath is None:
+        log.warning("Auto-load profile name %r is invalid — skipping GPU %d", name, gpu_index)
+        return False
 
     try:
         profile = load_profile(filepath)
@@ -144,10 +154,14 @@ def apply_with_retry(gpu_index: int, name: str, cfg, max_retries: int = 3) -> bo
         log.warning("Auto-load profile %r not found — skipping GPU %d", name, gpu_index)
         return False
 
-    expected: dict[int, int] = (
-        {int(k): v for k, v in profile.curve_deltas.items()}
-        if profile.curve_deltas else {}
-    )
+    try:
+        expected: dict[int, int] = (
+            {int(k): int(v) for k, v in profile.curve_deltas.items()}
+            if profile.curve_deltas else {}
+        )
+    except (TypeError, ValueError) as exc:
+        log.warning("Profile %r has malformed curve_deltas: %s", name, exc)
+        expected = {}
 
     for attempt in range(max_retries):
         try:

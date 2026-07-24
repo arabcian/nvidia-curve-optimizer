@@ -240,6 +240,34 @@ def _root_helper_is_trusted(path: str) -> tuple[bool, str]:
             f"{path} is group- or world-writable (mode {st.st_mode & 0o777:04o}). "
             "Refusing to run it as root."
         )
+    # A root-owned, root-only-writable file inside a directory someone else
+    # can write to is not actually protected: write permission on a
+    # directory is permission to unlink an entry and put a different file
+    # at that name. Walk up to / and require every component to be
+    # root-owned and not group/world-writable.
+    parent = os.path.dirname(os.path.abspath(path))
+    while True:
+        try:
+            dst = os.stat(parent)
+        except OSError as exc:
+            return False, f"cannot stat {parent}: {exc}"
+        if dst.st_uid != 0:
+            return False, (
+                f"{parent} is not owned by root (uid {dst.st_uid}) — a file "
+                f"inside it can be replaced. Refusing to run {path} as root."
+            )
+        if (dst.st_mode & stat.S_IWGRP or dst.st_mode & stat.S_IWOTH) and not (
+            dst.st_mode & stat.S_ISVTX
+        ):
+            return False, (
+                f"{parent} is group- or world-writable "
+                f"(mode {dst.st_mode & 0o777:04o}) — a file inside it can be "
+                f"replaced. Refusing to run {path} as root."
+            )
+        nxt = os.path.dirname(parent)
+        if nxt == parent:
+            break
+        parent = nxt
     return True, ""
 NVCURVE_PROFILES_DIR = "/etc/nvcurve/profiles"
 NVCURVE_CONFIG_PATH = "/etc/nvcurve/config.json"

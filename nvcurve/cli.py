@@ -930,9 +930,22 @@ def _persistent_cfg_load() -> dict:
     """Read /etc/nvcurve/config.json, returning {} if absent or unreadable."""
     try:
         with open(_PERSISTENT_CONFIG_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+            data = json.load(f)
+    except FileNotFoundError:
         return {}
+    except (json.JSONDecodeError, OSError) as exc:
+        # Say so instead of returning {} — an unreadable or corrupt config
+        # was indistinguishable from "not configured yet", so `service
+        # install` would happily overwrite it and the user would never learn
+        # their auto-load settings had been silently discarded.
+        print(f"nvcurve: warning: could not read {_PERSISTENT_CONFIG_FILE}: {exc}",
+              file=sys.stderr)
+        return {}
+    if not isinstance(data, dict):
+        print(f"nvcurve: warning: {_PERSISTENT_CONFIG_FILE} is not a JSON object — ignoring",
+              file=sys.stderr)
+        return {}
+    return data
 
 
 def _persistent_cfg_save(data: dict) -> None:
@@ -950,12 +963,11 @@ def _persistent_cfg_save(data: dict) -> None:
     except OSError:
         pass
 
-    with open(_PERSISTENT_CONFIG_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-    try:
-        os.chmod(_PERSISTENT_CONFIG_FILE, 0o644)
-    except OSError:
-        pass
+    # Atomic: the boot-time daemon reads this file to decide which profiles
+    # to auto-apply. A plain open("w") truncates first, so an interrupted
+    # write left a zero-length config that silently disabled auto-load.
+    from .atomicio import write_json as _atomic_write_json
+    _atomic_write_json(_PERSISTENT_CONFIG_FILE, data, 0o644)
 
 
 def _profile_config_read() -> dict:
@@ -1622,8 +1634,9 @@ def _cmd_serve_start(args, cfg: Config, open_browser: bool = False) -> None:
     # --direct: skip daemon round-trip (used when the daemon itself spawns us).
     if getattr(args, "direct", False):
         require_root()
-        with open(_SERVER_INFO_FILE, "w") as f:
-            json.dump({"pid": os.getpid(), "host": host, "port": port}, f)
+        from .atomicio import write_json as _atomic_write_json
+        _atomic_write_json(_SERVER_INFO_FILE,
+                           {"pid": os.getpid(), "host": host, "port": port}, 0o644)
         try:
             from .server import run as server_run
             server_run(host=host, port=port,
@@ -1676,8 +1689,9 @@ def _cmd_serve_start(args, cfg: Config, open_browser: bool = False) -> None:
         return
 
     # Foreground mode — write info file so clients can discover host:port.
-    with open(_SERVER_INFO_FILE, "w") as f:
-        json.dump({"pid": os.getpid(), "host": host, "port": port}, f)
+    from .atomicio import write_json as _atomic_write_json
+    _atomic_write_json(_SERVER_INFO_FILE,
+                       {"pid": os.getpid(), "host": host, "port": port}, 0o644)
     try:
         from .server import run as server_run
         server_run(

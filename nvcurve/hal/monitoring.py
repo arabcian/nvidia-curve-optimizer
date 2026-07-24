@@ -44,6 +44,13 @@ def shutdown_nvml() -> None:
         except _pynvml.NVMLError:
             pass
         _nvml_initialized = False
+        # hal.limits caches device handles keyed by index; they are only
+        # valid within an nvmlInit() session, so they must not outlive it.
+        try:
+            from .limits import invalidate_handle_cache
+            invalidate_handle_cache()
+        except Exception:
+            pass
 
 
 def get_driver_version() -> Optional[str]:
@@ -106,9 +113,12 @@ def _nvml_read(gpu_index: int) -> dict:
 
         try:
             out["fan_pct"] = float(_pynvml.nvmlDeviceGetFanSpeed(handle))
-        except _pynvml.NVMLError:
+        except Exception:
             pass
-    except _pynvml.NVMLError:
+    except Exception:
+        # Not just NVMLError: a pynvml/driver version mismatch surfaces as
+        # AttributeError or struct errors, which escaped this handler and
+        # made the 1 Hz monitor poller log a traceback every second.
         pass
     return out
 

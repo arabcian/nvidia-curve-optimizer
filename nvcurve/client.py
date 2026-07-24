@@ -82,11 +82,18 @@ class NvCurveClient:
         return r.json()
 
     def ping(self) -> bool:
+        """True only if a *usable* server answered.
+
+        This used to omit the Authorization header and return True for any
+        response at all — including the 401 the token middleware returns to
+        an unauthenticated caller. "Server is reachable but we cannot talk
+        to it" was therefore reported as a healthy server.
+        """
         try:
-            httpx.get(self._url("/api/gpu"), timeout=1.0)
-            return True
+            r = httpx.get(self._url("/api/gpu"), headers=self._headers(), timeout=1.0)
         except Exception:
             return False
+        return not r.is_error
 
     def gpus(self) -> list:
         return self._get("/api/gpus")

@@ -54,13 +54,15 @@ from .profiles.native import (
     list_profiles,
     delete_profile,
     rename_profile,
+    profile_path as _profile_path,
+    safe_profile_name,
 )
+from .atomicio import write_json as _atomic_write_json
 from .profiles.apply import apply_profile
 from .hal.vfcurve import (
     read_clock_offsets,
     read_curve,
-    reset_offsets,
-    write_global_offset,
+    read_curve_with_raw_ct,
     write_offsets,
 )
 from .safety import validate_write, validate_limits, check_negative_freq_warnings
@@ -610,13 +612,20 @@ def _persist_config_field(key: str, value) -> None:
             data = _json.load(f)
     except Exception:
         data = {}
+    if not isinstance(data, dict):
+        # Never let a corrupt config silently become a fresh one that drops
+        # every other setting root had put there.
+        log.warning("%s is not a JSON object — refusing to overwrite it", config_path)
+        return
     if value is not None:
         data[key] = value
     else:
         data.pop(key, None)
     try:
-        with open(config_path, "w") as f:
-            _json.dump(data, f)
+        # Atomic: this file is read by the boot-time daemon to decide which
+        # profiles to auto-apply. A truncated write here meant the next boot
+        # applied nothing, with no error anywhere.
+        _atomic_write_json(config_path, data, 0o644)
     except Exception as exc:
         log.warning("Failed to persist config field %r: %s", key, exc)
 
@@ -662,6 +671,17 @@ async def api_profile_save(req: ProfileSaveRequest, gpu_index: int = 0):
     gpu, g_state = _require_gpu(gpu_index)
     cfg: Config = _state["config"]
 
+    # This endpoint accepted any name at all and let save_profile() quietly
+    # rewrite it — a name of "..." collapsed to "" and produced a hidden
+    # /etc/nvcurve/profiles/.json that never appeared in a listing again,
+    # while the caller got back a cheerful {"ok": true}.
+    safe_name = safe_profile_name(req.name)
+    if not safe_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Profile name is empty after removing unsupported characters",
+        )
+
     state, err = await _run(read_curve, gpu, g_state["gpu_name"])
     if state is None:
         raise HTTPException(status_code=500, detail=f"Failed to read curve: {err}")
@@ -683,9 +703,8 @@ async def api_profile_save(req: ProfileSaveRequest, gpu_index: int = 0):
     mem_locked_min_mhz = None
     mem_locked_max_mhz = None
     import os as _os
-    existing_path = _os.path.join(cfg.profile_dir,
-                                   "".join(c for c in req.name if c.isalnum() or c in " _-()").strip() + ".json")
-    if _os.path.exists(existing_path):
+    existing_path = _profile_path(cfg.profile_dir, safe_name)
+    if existing_path and _os.path.exists(existing_path):
         try:
             existing = await _run(load_profile, existing_path)
             mem_locked_min_mhz = existing.mem_locked_min_mhz
@@ -694,7 +713,7 @@ async def api_profile_save(req: ProfileSaveRequest, gpu_index: int = 0):
             pass
 
     data = ProfileData(
-        name=req.name,
+        name=safe_name,
         gpu_name=g_state["gpu_name"],
         curve_deltas=curve_deltas,
         mem_offset_mhz=mem_offset_mhz,
@@ -703,8 +722,8 @@ async def api_profile_save(req: ProfileSaveRequest, gpu_index: int = 0):
         mem_locked_max_mhz=mem_locked_max_mhz,
     )
     filepath = await _run(save_profile, cfg.profile_dir, data)
-    g_state["active_profile"] = req.name
-    return {"ok": True, "filepath": filepath}
+    g_state["active_profile"] = safe_name
+    return {"ok": True, "filepath": filepath, "name": safe_name}
 
 
 async def _auto_apply_profile_with_retry(
@@ -715,18 +734,23 @@ async def _auto_apply_profile_with_retry(
     Raises FileNotFoundError if the profile does not exist (no point retrying).
     Logs a warning and gives up after max_retries failed attempts.
     """
-    import os as _os
     cfg: Config = _state["config"]
     g_state = _get_gpu_state(gpu_index)
     gpu = g_state["gpu"]
 
-    safe_name = "".join(c for c in name if c.isalnum() or c in " _-()").strip()
-    filepath = _os.path.join(cfg.profile_dir, f"{safe_name}.json")
+    filepath = _profile_path(cfg.profile_dir, name)
+    if filepath is None:
+        raise FileNotFoundError(f"invalid profile name: {name!r}")
     profile = await _run(load_profile, filepath)  # raises FileNotFoundError if missing
 
-    expected: dict[int, int] = (
-        {int(k): v for k, v in profile.curve_deltas.items()} if profile.curve_deltas else {}
-    )
+    try:
+        expected: dict[int, int] = (
+            {int(k): int(v) for k, v in profile.curve_deltas.items()}
+            if profile.curve_deltas else {}
+        )
+    except (TypeError, ValueError) as exc:
+        log.warning("Profile %r has malformed curve_deltas: %s", name, exc)
+        expected = {}
 
     for attempt in range(max_retries):
         errs, warns = await _apply_profile(name, gpu_index)
@@ -847,18 +871,22 @@ async def api_profile_delete(name: str):
 async def api_profile_rename(name: str, req: ProfileRenameRequest):
     """Rename a profile."""
     cfg: Config = _state["config"]
-    if not req.new_name.strip():
-        raise HTTPException(status_code=400, detail="New name cannot be empty")
-    ok = await _run(rename_profile, cfg.profile_dir, name, req.new_name.strip())
+    new_safe = safe_profile_name(req.new_name)
+    if not new_safe:
+        raise HTTPException(
+            status_code=400,
+            detail="New name cannot be empty after removing unsupported characters",
+        )
+    ok = await _run(rename_profile, cfg.profile_dir, name, new_safe)
     if not ok:
         raise HTTPException(status_code=404, detail=f"Profile '{name}' not found")
     for g_state in _state["gpus"].values():
         if g_state["active_profile"] == name:
-            g_state["active_profile"] = req.new_name.strip()
+            g_state["active_profile"] = new_safe
     changed = any(v == name for v in cfg.auto_load_profiles.values())
     if changed:
         cfg.auto_load_profiles = {
-            k: (req.new_name.strip() if v == name else v)
+            k: (new_safe if v == name else v)
             for k, v in cfg.auto_load_profiles.items()
         }
         _persist_auto_load_profiles(cfg.auto_load_profiles)
@@ -1042,20 +1070,27 @@ async def api_limits_reset(gpu_index: int = 0):
 
 # ── Write endpoints ────────────────────────────────────────────────────────────
 
-async def _reconcile_check(gpu_index: int) -> dict | None:
-    """Re-read current offsets and return a warning dict if they differ from our last known state.
+def _reconcile_diff(g_state: dict, last: list[int], current: list[int]) -> dict | None:
+    """Compare a known-good offset baseline against a freshly read one.
 
-    Returns None if no external change detected (or no baseline).
+    Split out of _reconcile_check() so a caller that has *already* read the
+    ClockBoostTable (see api_curve_write) can reuse that read instead of
+    issuing a second one purely to run this comparison.
     """
-    g_state = _get_gpu_state(gpu_index)
-    gpu = g_state["gpu"]
-    last = g_state["last_offsets"]
-    if last is None:
-        return None
-
-    current, err = await _run(read_clock_offsets, gpu)
-    if current is None:
-        return None  # Can't read — let the write attempt proceed
+    # zip() stops at the shorter sequence, so a baseline captured when the
+    # driver reported a different number of points silently compared only
+    # the overlap and reported "no external change" for the rest.
+    if len(last) != len(current):
+        g_state["active_profile"] = None
+        return {
+            "warning": "curve_length_changed",
+            "message": (
+                f"Curve point count changed since last read "
+                f"({len(last)} -> {len(current)}). The write will proceed "
+                "using the current hardware state."
+            ),
+            "changed_points": [],
+        }
 
     changed = [i for i, (a, b) in enumerate(zip(last, current)) if a != b]
     if not changed:
@@ -1077,32 +1112,52 @@ async def _reconcile_check(gpu_index: int) -> dict | None:
 
 @app.post("/api/curve/write")
 async def api_curve_write(req: WriteRequest, gpu_index: int = 0):
-    """Write per-point frequency offsets. {deltas: {point_index: delta_kHz}}"""
+    """Write per-point frequency offsets. {deltas: {point_index: delta_kHz}}
+
+    Driver round-trips: this used to issue five separate reads for a single
+    write — read_curve (VFP + ClockBoostTable) for the frequency warnings,
+    read_clock_offsets for the reconciliation check, read_clock_table_raw
+    inside snapshot_save, and read_clock_table_raw again inside
+    build_write_buffer — all describing the same instant of hardware state.
+    One read_curve_with_raw_ct() now feeds all four, which also removes a
+    real correctness wrinkle: the reconciliation check, the snapshot, and
+    the buffer the write is built on are now guaranteed to be the same
+    table rather than three tables read a few milliseconds apart.
+    """
     gpu, g_state = _require_gpu(gpu_index)
     cfg: Config = _state["config"]
 
-    vfp_state, _ = await _run(read_curve, gpu, g_state["gpu_name"])
-
+    # Validate before touching the driver at all — an out-of-range delta
+    # should not cost a curve read.
     effective_limit = req.max_delta_khz if req.max_delta_khz is not None else cfg.max_delta_khz
     errors = validate_write(req.deltas, effective_limit)
     if errors:
         raise HTTPException(status_code=400, detail={"errors": errors})
 
-    # Check for negative-freq warnings before writing (best-effort, non-blocking)
-    freq_warnings: list[str] = []
-    if vfp_state:
-        vfp_freqs = [p.freq_khz for p in vfp_state.points]
+    async with g_state["write_lock"]:
+        vfp_state, ct_raw, read_err = await _run(
+            read_curve_with_raw_ct, gpu, g_state["gpu_name"]
+        )
+        if vfp_state is None:
+            raise HTTPException(status_code=500, detail=f"Failed to read curve: {read_err}")
+
+        current_offsets = [p.delta_khz for p in vfp_state.points]
+
+        # Check for negative-freq warnings before writing (best-effort).
         freq_warnings = check_negative_freq_warnings(
-            req.deltas, vfp_freqs, g_state["last_offsets"] or []
+            req.deltas,
+            [p.freq_khz for p in vfp_state.points],
+            g_state["last_offsets"] or [],
         )
 
-    async with g_state["write_lock"]:
-        warning = await _reconcile_check(gpu_index)
+        last = g_state["last_offsets"]
+        warning = _reconcile_diff(g_state, last, current_offsets) if last is not None else None
 
         if cfg.auto_snapshot:
-            await _run(snapshot_save, gpu, g_state["gpu_name"], cfg.snapshot_dir, cfg.max_snapshots)
+            await _run(snapshot_save, gpu, g_state["gpu_name"], cfg.snapshot_dir,
+                       cfg.max_snapshots, ct_raw)
 
-        ret, desc = await _run(write_offsets, gpu, req.deltas)
+        ret, desc = await _run(write_offsets, gpu, req.deltas, False, False, ct_raw)
         if ret != 0:
             raise HTTPException(status_code=500, detail=f"Write failed ({ret}): {desc}")
 
@@ -1124,30 +1179,38 @@ async def api_curve_write_global(req: GlobalOffsetRequest, gpu_index: int = 0):
     gpu, g_state = _require_gpu(gpu_index)
     cfg: Config = _state["config"]
 
-    vfp_state, _ = await _run(read_curve, gpu, g_state["gpu_name"])
-    if not vfp_state:
-        raise HTTPException(status_code=500, detail="Failed to read curve")
+    async with g_state["write_lock"]:
+        # Single read feeds domain classification, the freq warnings, the
+        # reconciliation check, the snapshot, and the write buffer —
+        # write_global_offset() would otherwise read the curve a second
+        # time internally on top of everything here. See api_curve_write.
+        vfp_state, ct_raw, read_err = await _run(
+            read_curve_with_raw_ct, gpu, g_state["gpu_name"]
+        )
+        if vfp_state is None:
+            raise HTTPException(status_code=500, detail=f"Failed to read curve: {read_err}")
 
-    all_deltas = {p.index: req.delta_khz for p in vfp_state.points if p.domain == "gpu"}
-    effective_limit = req.max_delta_khz if req.max_delta_khz is not None else cfg.max_delta_khz
-    errors = validate_write(all_deltas, effective_limit)
-    if errors:
-        raise HTTPException(status_code=400, detail={"errors": errors})
+        all_deltas = {p.index: req.delta_khz for p in vfp_state.points if p.domain == "gpu"}
+        effective_limit = req.max_delta_khz if req.max_delta_khz is not None else cfg.max_delta_khz
+        errors = validate_write(all_deltas, effective_limit)
+        if errors:
+            raise HTTPException(status_code=400, detail={"errors": errors})
 
-    freq_warnings: list[str] = []
-    if vfp_state:
-        vfp_freqs = [p.freq_khz for p in vfp_state.points]
         freq_warnings = check_negative_freq_warnings(
-            all_deltas, vfp_freqs, g_state["last_offsets"] or []
+            all_deltas,
+            [p.freq_khz for p in vfp_state.points],
+            g_state["last_offsets"] or [],
         )
 
-    async with g_state["write_lock"]:
-        warning = await _reconcile_check(gpu_index)
+        current_offsets = [p.delta_khz for p in vfp_state.points]
+        last = g_state["last_offsets"]
+        warning = _reconcile_diff(g_state, last, current_offsets) if last is not None else None
 
         if cfg.auto_snapshot:
-            await _run(snapshot_save, gpu, g_state["gpu_name"], cfg.snapshot_dir, cfg.max_snapshots)
+            await _run(snapshot_save, gpu, g_state["gpu_name"], cfg.snapshot_dir,
+                       cfg.max_snapshots, ct_raw)
 
-        ret, desc = await _run(write_global_offset, gpu, req.delta_khz)
+        ret, desc = await _run(write_offsets, gpu, all_deltas, False, False, ct_raw)
         if ret != 0:
             raise HTTPException(status_code=500, detail=f"Write failed ({ret}): {desc}")
 
@@ -1169,12 +1232,22 @@ async def api_curve_reset(gpu_index: int = 0):
     cfg: Config = _state["config"]
 
     async with g_state["write_lock"]:
-        warning = await _reconcile_check(gpu_index)
+        vfp_state, ct_raw, read_err = await _run(
+            read_curve_with_raw_ct, gpu, g_state["gpu_name"]
+        )
+        if vfp_state is None:
+            raise HTTPException(status_code=500, detail=f"Failed to read curve: {read_err}")
+
+        current_offsets = [p.delta_khz for p in vfp_state.points]
+        last = g_state["last_offsets"]
+        warning = _reconcile_diff(g_state, last, current_offsets) if last is not None else None
 
         if cfg.auto_snapshot:
-            await _run(snapshot_save, gpu, g_state["gpu_name"], cfg.snapshot_dir, cfg.max_snapshots)
+            await _run(snapshot_save, gpu, g_state["gpu_name"], cfg.snapshot_dir,
+                       cfg.max_snapshots, ct_raw)
 
-        ret, desc = await _run(reset_offsets, gpu)
+        zero_deltas = {p.index: 0 for p in vfp_state.points if p.domain == "gpu"}
+        ret, desc = await _run(write_offsets, gpu, zero_deltas, False, False, ct_raw)
         if ret != 0:
             raise HTTPException(status_code=500, detail=f"Reset failed ({ret}): {desc}")
 
@@ -1221,6 +1294,20 @@ async def api_curve_verify(req: VerifyRequest, gpu_index: int = 0):
     points_result = []
     all_matched = True
     for point, expected in sorted(req.deltas.items()):
+        # validate_write() bounds the point against CT_POINTS (the struct's
+        # capacity), but the driver can return a shorter offset list than
+        # that — indexing it blind raised IndexError and turned a normal
+        # verify run into an unhandled 500.
+        if point >= len(after_offsets):
+            all_matched = False
+            points_result.append({
+                "point": point,
+                "expected_khz": expected,
+                "actual_khz": None,
+                "match": False,
+                "note": "point not present in driver read-back",
+            })
+            continue
         actual = after_offsets[point]
         match = actual == expected
         if not match:
@@ -1295,10 +1382,16 @@ async def ws_monitor(ws: WebSocket):
     await ws.accept()
     try:
         data = await ws.receive_json()
-        if data.get("action") != "subscribe":
+        if not isinstance(data, dict) or data.get("action") != "subscribe":
             await ws.close()
             return
         gpu_index = data.get("gpu_index", 0)
+        # A non-int (or an unhashable dict/list) used to reach the state
+        # lookup below and raise TypeError *outside* this try block,
+        # tearing the handler down with a traceback instead of a clean close.
+        if isinstance(gpu_index, bool) or not isinstance(gpu_index, int):
+            await ws.close()
+            return
     except WebSocketDisconnect:
         return
     except Exception:
@@ -1333,10 +1426,13 @@ async def ws_curve(ws: WebSocket):
     await ws.accept()
     try:
         data = await ws.receive_json()
-        if data.get("action") != "subscribe":
+        if not isinstance(data, dict) or data.get("action") != "subscribe":
             await ws.close()
             return
         gpu_index = data.get("gpu_index", 0)
+        if isinstance(gpu_index, bool) or not isinstance(gpu_index, int):
+            await ws.close()
+            return
     except WebSocketDisconnect:
         return
     except Exception:

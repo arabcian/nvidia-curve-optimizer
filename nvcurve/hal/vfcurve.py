@@ -473,3 +473,35 @@ def reset_offsets(gpu, dry_run: bool = False) -> tuple[int, str]:
 
     point_deltas = {p.index: 0 for p in curve.points if p.domain == "gpu"}
     return write_offsets(gpu, point_deltas, dry_run=dry_run, current_raw=ct_raw)
+
+
+def reset_all_offsets(gpu, dry_run: bool = False) -> tuple[int, str]:
+    """Zero every populated point's offset — gpu domain AND memory domain.
+
+    root_helper's pre-apply "clean baseline" step used to do this by
+    shelling out to `write --range 0-132 --delta 0`, a range hardcoded
+    from the point layout of one specific GPU (127 gpu-domain points +
+    6 memory-domain points at indices 127-132). That range is not a
+    property of the driver or the CT_POINTS buffer size — it's just
+    where the boost mask happened to end on that card. On a different
+    GPU (different point count, or a memory domain that starts/ends at
+    different indices — e.g. a different die within the same
+    generation), writing mask bits for indices the driver's
+    GetClockBoostMask never marked active makes SetClockBoostTable
+    reject the entire write with GENERIC_ERROR, rather than silently
+    ignoring the extra indices.
+
+    This mirrors write_memory_offset()'s existing "discover domain
+    indices from the actual curve, never assume them" approach, just
+    applied to *all* populated points instead of one domain, so a
+    single call resets exactly the points that exist on whatever GPU
+    is plugged in — nothing more, nothing less.
+    """
+    curve, ct_raw, err = read_curve_with_raw_ct(gpu)
+    if not curve:
+        return -999, f"Failed to read curve: {err}"
+
+    point_deltas = {p.index: 0 for p in curve.points}
+    if not point_deltas:
+        return -999, "No populated points found in curve"
+    return write_offsets(gpu, point_deltas, dry_run=dry_run, current_raw=ct_raw)

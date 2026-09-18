@@ -37,12 +37,6 @@ NVCURVE_PROJECT_DIR = _HELPER_DIR
 # ─── Fixed, FHS-friendly paths ──────────────────────────────────────────
 NVCURVE_PROFILES_DIR = "/etc/nvcurve/profiles"
 
-# Point index range used for the "reset to a known baseline before applying"
-# step. 132 is the last point on the GPU this was developed against; `nvcurve
-# write` clamps to the real point count, so a GPU with fewer points is
-# handled, but this stays a hardcoded assumption worth revisiting if the tool
-# is ever run on a card with more.
-RESET_POINT_RANGE = "0-132"
 NVCURVE_CONFIG_PATH = "/etc/nvcurve/config.json"
 
 # Result files are written here (root-owned tmpfs dir) instead of /tmp to
@@ -324,7 +318,7 @@ def op_apply_gpu_offsets(params: dict) -> dict:
         }
 
     # 1. Reset the curve first so the profile applies cleanly on top.
-    reset_result = _run_nvcurve("write", "--range", RESET_POINT_RANGE, "--delta", "0")
+    reset_result = _run_nvcurve("write", "--reset-all")
     if reset_result.returncode != 0:
         return {"ok": False, "error": f"Reset failed: {reset_result.stderr.strip()}"}
 
@@ -368,7 +362,7 @@ def op_apply_named_profile(params: dict) -> dict:
         return {"ok": False, "error": f"Profile not found: {name}"}
 
     # Reset first so the profile applies cleanly on top of a known baseline.
-    reset_result = _run_nvcurve("write", "--range", RESET_POINT_RANGE, "--delta", "0")
+    reset_result = _run_nvcurve("write", "--reset-all")
     if reset_result.returncode != 0:
         return {"ok": False, "error": f"Reset failed: {reset_result.stderr.strip()}"}
 
@@ -391,7 +385,7 @@ def op_apply_named_profile(params: dict) -> dict:
 
 
 def op_reset_gpu_curve(params: dict) -> dict:
-    reset_proc = _run_nvcurve("write", "--range", RESET_POINT_RANGE, "--delta", "0")
+    reset_proc = _run_nvcurve("write", "--reset-all")
     if reset_proc.returncode != 0:
         return {"ok": False, "error": f"Reset write failed: {reset_proc.stderr.strip() if reset_proc.stderr else reset_proc.returncode}"}
 

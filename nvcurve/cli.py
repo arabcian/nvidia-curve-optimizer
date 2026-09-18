@@ -677,8 +677,8 @@ def cmd_inspect(args):
 
 
 def cmd_write(args):
-    if not args.reset and args.delta is None:
-        print("Error: --delta is required (use --reset to zero all offsets)", file=sys.stderr)
+    if not args.reset and not args.reset_all and args.delta is None:
+        print("Error: --delta is required (use --reset/--reset-all to zero all offsets)", file=sys.stderr)
         sys.exit(2)
 
     delta_khz = int((args.delta or 0.0) * 1000)
@@ -695,6 +695,21 @@ def cmd_write(args):
         gpu, _ = get_gpu(index=getattr(args, "gpu_index", 0))
         reset_offsets(gpu)
         print("Reset: all offsets set to 0.")
+        return
+
+    if args.reset_all:
+        if args.dry_run:
+            print("DRY RUN — would reset all offsets to 0 (gpu + memory domain).")
+            return
+        require_root()
+        from .hal.gpu import get_gpu
+        from .hal.vfcurve import reset_all_offsets
+        gpu, _ = get_gpu(index=getattr(args, "gpu_index", 0))
+        ret, desc = reset_all_offsets(gpu)
+        if ret != 0:
+            print(f"Write failed ({ret}): {desc}", file=sys.stderr)
+            sys.exit(1)
+        print("Reset: all offsets set to 0 (gpu + memory domain).")
         return
 
     elif args.point is not None:
@@ -1796,6 +1811,9 @@ Examples:
     tgt.add_argument("--global", dest="glob", action="store_true",
                      help="All points (like global NVML offset)")
     tgt.add_argument("--reset", action="store_true", help="Reset all offsets to 0")
+    tgt.add_argument("--reset-all", action="store_true",
+                     help="Reset all offsets to 0, gpu AND memory domain "
+                          "(indices discovered dynamically, not hardcoded)")
     p_write.add_argument("--delta", type=float, default=None,
                          help="Frequency offset in MHz (e.g. 15, -30). "
                               "Required unless --reset is used.")

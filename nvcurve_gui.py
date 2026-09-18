@@ -990,7 +990,7 @@ class NVCurveWindow(QMainWindow):
 
         mem_label = SL("Memory Offset:", color=C_GREY)
         self.mem_offset_spin = QSpinBox()
-        self.mem_offset_spin.setRange(-1500, 1500)
+        self.mem_offset_spin.setRange(-3000, 3000)
         self.mem_offset_spin.setValue(0)
         self.mem_offset_spin.setSuffix(" MHz")
         self.mem_offset_spin.setFixedHeight(26)
@@ -1309,7 +1309,6 @@ class NVCurveWindow(QMainWindow):
             if offset != 0:
                 offsets[str(i)] = offset * 1000
         mem_off = self.mem_offset_spin.value()
-        mem_off_nvml = mem_off * 2
         vram_lock_max = self.vram_lock_max_spin.value()
         vram_lock_min = self.vram_lock_min_spin.value()
         if vram_lock_max != 0 and vram_lock_min == 0:
@@ -1317,7 +1316,7 @@ class NVCurveWindow(QMainWindow):
         return {
             "name": "custom",
             "curve_deltas": offsets,
-            "mem_offset_mhz": mem_off_nvml,
+            "mem_offset_mhz": mem_off,
             "power_limit_w": None,
             "mem_locked_min_mhz": vram_lock_min if vram_lock_max != 0 else None,
             "mem_locked_max_mhz": vram_lock_max if vram_lock_max != 0 else None,
@@ -1405,7 +1404,7 @@ class NVCurveWindow(QMainWindow):
         curve_deltas = data.get('curve_deltas', {})
         mem_offset_raw = data.get('mem_offset_mhz', 0) or 0
         if mem_offset_raw != 0:
-            mem_offset = mem_offset_raw // 2
+            mem_offset = mem_offset_raw
         elif '131' in curve_deltas:
             mem_offset = curve_deltas['131'] // 1000
         elif '132' in curve_deltas:
@@ -1567,7 +1566,6 @@ class NVCurveWindow(QMainWindow):
                 offsets_to_apply[i] = delta * 1000
 
         mem_off = self.mem_offset_spin.value()
-        mem_off_nvml = mem_off * 2
 
         vram_lock_max = self.vram_lock_max_spin.value()
         vram_lock_min = self.vram_lock_min_spin.value()
@@ -1581,7 +1579,7 @@ class NVCurveWindow(QMainWindow):
         profile_data = {
             "name": profile_name,
             "curve_deltas": {str(k): v for k, v in offsets_to_apply.items()},
-            "mem_offset_mhz": mem_off_nvml if mem_off != 0 else None,
+            "mem_offset_mhz": mem_off if mem_off != 0 else None,
             "power_limit_w": None,
             "mem_locked_min_mhz": vram_lock_min if vram_lock_max != 0 else None,
             "mem_locked_max_mhz": vram_lock_max if vram_lock_max != 0 else None,
@@ -1660,6 +1658,41 @@ class NVCurveWindow(QMainWindow):
                 data = json.load(f)
             if "vf_curve" in data:
                 all_points = data["vf_curve"]
+
+                # The GPU-domain branch below has always populated
+                # core_offset_spin from the read curve; the memory-domain
+                # points were read into `all_points` too but nothing ever
+                # forwarded them to mem_offset_spin, so the box stayed at
+                # its old/manual value after every "Read Current Curve" —
+                # silently disagreeing with the hardware. Mirror the same
+                # "uniform offset across every point of the domain" logic
+                # used for the core offset.
+                #
+                # freq_offset_kHz here comes straight off the same
+                # ClockBoostTable NVML's mem clock-offset writes through
+                # (see hal/limits.py's set_clock_offsets doubling note), so
+                # it's in the same raw/half-rate MHz domain and needs the
+                # same /2 conversion to the effective MHz the Mem Offset
+                # box and every saved profile use.
+                mem_points = [p for p in all_points if p.get("domain") == "memory"]
+                if mem_points:
+                    mem_offsets_raw = [p.get("freq_offset_kHz", 0) // 1000 for p in mem_points]
+                    if all(o == mem_offsets_raw[0] for o in mem_offsets_raw):
+                        mem_offset_effective = int(round(mem_offsets_raw[0] / 2))
+                    else:
+                        # Non-uniform memory-domain deltas shouldn't happen
+                        # via this app, but don't silently pick one point
+                        # over another if it does — average them instead.
+                        mem_offset_effective = int(round((sum(mem_offsets_raw) / len(mem_offsets_raw)) / 2))
+                    self.mem_offset_spin.blockSignals(True)
+                    self.mem_offset_spin.setValue(mem_offset_effective)
+                    self.mem_offset_spin.blockSignals(False)
+                    self._log(f"ℹ️ Memory offset detected: {mem_offset_effective} MHz")
+                else:
+                    self.mem_offset_spin.blockSignals(True)
+                    self.mem_offset_spin.setValue(0)
+                    self.mem_offset_spin.blockSignals(False)
+
                 gpu_points = [p for p in all_points if p.get("domain") == "gpu"]
                 if gpu_points:
                     points = []

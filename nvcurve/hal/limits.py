@@ -210,6 +210,11 @@ def get_clock_offsets(gpu_index: int = 0) -> dict:
 
     Keys: gpc_offset_mhz, mem_offset_mhz (both int or None on failure).
     Calls nvmlDeviceGetClockOffsets once per clock domain (GRAPHICS, MEM).
+
+    mem_offset_mhz is converted from NVML's raw (half-rate) domain back to
+    effective/data-rate MHz — the inverse of the doubling set_clock_offsets()
+    applies before writing — so callers always deal in the same units they
+    set.
     """
     out = {"gpc_offset_mhz": None, "mem_offset_mhz": None}
     if not _NVML_AVAILABLE:
@@ -242,6 +247,8 @@ def get_clock_offsets(gpu_index: int = 0) -> dict:
                 log.debug("nvmlDeviceGetClockOffsets(type=%d): %s", clock_type, exc)
 
         if used_new_api:
+            if out["mem_offset_mhz"] is not None:
+                out["mem_offset_mhz"] = _raw_mem_offset_to_effective(out["mem_offset_mhz"])
             return out
 
         # Deprecated per-domain fallback.
@@ -253,13 +260,26 @@ def get_clock_offsets(gpu_index: int = 0) -> dict:
         if hasattr(pynvml, "nvmlDeviceGetMemClkVfOffset"):
             try:
                 res = pynvml.nvmlDeviceGetMemClkVfOffset(handle)
-                out["mem_offset_mhz"] = int(res[0] if isinstance(res, (list, tuple)) else res)
+                raw = int(res[0] if isinstance(res, (list, tuple)) else res)
+                out["mem_offset_mhz"] = _raw_mem_offset_to_effective(raw)
             except Exception as exc:
                 log.debug("nvmlDeviceGetMemClkVfOffset: %s", exc)
 
     except Exception as exc:
         log.warning("get_clock_offsets: %s", exc)
     return out
+
+
+def _raw_mem_offset_to_effective(raw_mhz: int) -> int:
+    """Convert a raw (half-rate) NVML mem-offset value to effective MHz.
+
+    Inverse of the doubling set_clock_offsets() does before writing.
+    Round-to-nearest (not truncation) so a value written by this app
+    (always even, since it's 2 * an int) round-trips exactly, while a
+    value set by some other tool in odd raw MHz still comes back sane
+    instead of silently losing a MHz to floor division every read.
+    """
+    return int(round(raw_mhz / 2))
 
 
 def set_clock_offsets(
@@ -273,6 +293,19 @@ def set_clock_offsets(
     Calls nvmlDeviceSetClockOffsets once per requested domain (GRAPHICS, MEM).
     Falls back to deprecated per-domain functions when the new API returns an
     error (e.g. NVML_ERROR_DEPRECATED=25 on Blackwell with driver 590.x).
+
+    GDDR memory is double-data-rate: the value NVML's CLOCK_MEM
+    clockOffsetMHz actually nudges is the *raw* memory clock domain, not
+    the effective/data-rate MHz that every offset elsewhere in this app
+    (and every value the user types into the Mem Offset box) is expressed
+    in. Confirmed empirically (and matches other NVML-based tools, e.g.
+    LACT/GreenWithEnvy): sending the raw user-entered value here only
+    moves the achieved effective clock by half of it. So mem_offset_mhz
+    (a caller-facing effective-MHz value) is doubled right here, at the
+    NVML boundary, before being written — this is the one and only place
+    that needs to know about the driver's raw-domain convention.
+    get_clock_offsets() below undoes this (halves what NVML reports back)
+    so a caller always sees/sets the same effective-MHz units.
     """
     if gpc_offset_mhz is None and mem_offset_mhz is None:
         return True, "OK"
@@ -281,11 +314,16 @@ def set_clock_offsets(
     try:
         handle = _get_handle(gpu_index)
 
+        # See docstring: mem offsets are in effective/data-rate MHz at every
+        # call site in this app, but NVML's CLOCK_MEM offset is in raw
+        # (half-rate) MHz, so it needs to be doubled before it reaches NVML.
+        mem_offset_raw = mem_offset_mhz * 2 if mem_offset_mhz is not None else None
+
         domains = []
         if gpc_offset_mhz is not None:
             domains.append((_NVML_CLOCK_GRAPHICS, gpc_offset_mhz))
-        if mem_offset_mhz is not None:
-            domains.append((_NVML_CLOCK_MEM, mem_offset_mhz))
+        if mem_offset_raw is not None:
+            domains.append((_NVML_CLOCK_MEM, mem_offset_raw))
 
         _pynvml_set = getattr(pynvml, "nvmlDeviceSetClockOffsets", None)
         fn_set = _try_nvml_fn("nvmlDeviceSetClockOffsets") if _pynvml_set is None else None
@@ -315,9 +353,9 @@ def set_clock_offsets(
                 pynvml.nvmlDeviceSetGpcClkVfOffset(handle, gpc_offset_mhz)
             except Exception as exc:
                 errs.append(f"GPC: {exc}")
-        if mem_offset_mhz is not None and hasattr(pynvml, "nvmlDeviceSetMemClkVfOffset"):
+        if mem_offset_raw is not None and hasattr(pynvml, "nvmlDeviceSetMemClkVfOffset"):
             try:
-                pynvml.nvmlDeviceSetMemClkVfOffset(handle, mem_offset_mhz)
+                pynvml.nvmlDeviceSetMemClkVfOffset(handle, mem_offset_raw)
             except Exception as exc:
                 errs.append(f"MEM: {exc}")
         if errs:
@@ -332,13 +370,21 @@ def set_clock_offsets(
 # ── Range queries ─────────────────────────────────────────────────────────────
 
 def get_mem_offset_range(gpu_index: int = 0) -> dict:
-    """Return the min/max allowed memory clock offset (MHz).
+    """Return the min/max allowed memory clock offset (effective MHz).
 
     Keys: min_mem_offset_mhz, max_mem_offset_mhz.
     Uses nvmlDeviceGetMemClkMinMaxVfOffset; falls back to observed RTX values.
+
+    NVML reports this range in the same raw (half-rate) domain as
+    get_clock_offsets()/set_clock_offsets() — see the doubling note on
+    set_clock_offsets(). Everything this app compares mem_offset_mhz
+    against (validate_limits, the GUI's spin box, saved profiles) is in
+    effective MHz, so the raw range is halved here too, once, at the
+    same NVML boundary.
     """
-    # Observed RTX 5090 defaults (NvAPI GetClockBoostRanges says -1000/+3000).
-    out = {"min_mem_offset_mhz": -1000, "max_mem_offset_mhz": 3000}
+    # Observed RTX 5090 defaults (NvAPI GetClockBoostRanges says -1000/+3000
+    # raw, i.e. -500/+1500 effective).
+    out = {"min_mem_offset_mhz": -500, "max_mem_offset_mhz": 1500}
     if not _NVML_AVAILABLE:
         return out
     try:
@@ -356,6 +402,8 @@ def get_mem_offset_range(gpu_index: int = 0) -> dict:
                     out["min_mem_offset_mhz"] = int(min_v)
                 if max_v is not None:
                     out["max_mem_offset_mhz"] = int(max_v)
+            out["min_mem_offset_mhz"] = int(round(out["min_mem_offset_mhz"] / 2))
+            out["max_mem_offset_mhz"] = int(round(out["max_mem_offset_mhz"] / 2))
             return out
 
         fn = _try_nvml_fn("nvmlDeviceGetMemClkMinMaxVfOffset")
@@ -364,8 +412,8 @@ def get_mem_offset_range(gpu_index: int = 0) -> dict:
             max_v = ctypes.c_int(0)
             rc = fn(handle, ctypes.byref(min_v), ctypes.byref(max_v))
             if rc == 0:
-                out["min_mem_offset_mhz"] = int(min_v.value)
-                out["max_mem_offset_mhz"] = int(max_v.value)
+                out["min_mem_offset_mhz"] = int(round(min_v.value / 2))
+                out["max_mem_offset_mhz"] = int(round(max_v.value / 2))
 
     except Exception as exc:
         log.debug("get_mem_offset_range: %s", exc)

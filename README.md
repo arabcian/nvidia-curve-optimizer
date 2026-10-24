@@ -1,5 +1,7 @@
 # nvcurve-gui
 
+<img width="1575" height="885" alt="Screenshot" src="https://github.com/user-attachments/assets/cb3262ca-94d2-448d-99ba-58ebdd0a6255" />
+
 > ## ⚠️ Disclaimer — read before using
 >
 > This tool works by calling **undocumented, private NVIDIA NvAPI

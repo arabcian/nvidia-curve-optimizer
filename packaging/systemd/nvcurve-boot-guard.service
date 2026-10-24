@@ -1,0 +1,25 @@
+# nvcurve boot guard (systemd). Pulled in by nvcurve-autoload.service.
+# Arms at boot, disarms after 3 minutes of stable uptime or on a clean
+# shutdown; a boot that dies armed pauses nvcurve-autoload (ExecCondition)
+# until it is resumed with `sudo nvcurve-boot-guard reset`.
+
+[Unit]
+Description=nvcurve boot guard
+After=local-fs.target systemd-tmpfiles-setup.service
+Before=nvcurve-autoload.service
+
+[Service]
+Type=simple
+ExecStartPre=@LIBEXEC@/nvcurve-boot-guard arm
+ExecStart=@LIBEXEC@/nvcurve-boot-guard watch
+TimeoutStopSec=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/nvcurve
+StateDirectory=nvcurve
+
+[Install]
+WantedBy=multi-user.target

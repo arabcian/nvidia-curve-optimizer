@@ -1,0 +1,27 @@
+#!/sbin/openrc-run
+# nvcurve boot guard. Pulled in by nvcurve-autoload (need).
+# Arms at boot, disarms after 3 minutes of stable uptime or on a clean
+# shutdown (stop); a boot that dies armed pauses nvcurve-autoload until it is
+# resumed with `nvcurve-boot-guard reset`.
+
+description="Pause the nvcurve boot-time GPU profile after a crashed boot"
+GUARD="@LIBEXEC@/nvcurve-boot-guard"
+
+depend() {
+	need localmount
+	before nvcurve-autoload
+}
+
+start() {
+	ebegin "Arming nvcurve boot guard"
+	"${GUARD}" arm
+	eend $?
+	# Disarm once the boot has been stable for the window (180 s).
+	( sleep 180; "${GUARD}" disarm ) >/dev/null 2>&1 &
+}
+
+stop() {
+	# Clean shutdown / reboot: this boot did not crash.
+	"${GUARD}" shutdown >/dev/null 2>&1
+	return 0
+}

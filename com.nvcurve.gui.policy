@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>nvcurve-gui</vendor>
+  <!--
+    nvcurve-gui — polkit actions. Two actions, one per Rust root helper, each pinned to its helper by
+    org.freedesktop.policykit.exec.path (without that annotation pkexec falls back to the generic
+    org.freedesktop.policykit.exec action and asks for a password on every call, with no caching).
+    @LIBEXEC@ is replaced by install.sh. Both helpers are installed root:root under @LIBEXEC@:
+    nvcurve-root-helper 0700, nvcurve-sensors 0755, so a non-root user cannot swap their content.
+
+    The password-free grant (wheel/sudo, local active session) comes only from
+    /etc/polkit-1/rules.d/49-nvcurve-gui.rules (security level 1). The defaults below are the safe
+    fallback when that file is absent or is installed at level 2: set-params asks for the administrator
+    password (auth_admin_keep: kept for polkit's cache window), and only the read-only sensors action
+    stays allow_active=yes.
+  -->
+  <action id="com.nvcurve.gui.set-params">
+    <description>Apply NVIDIA GPU V/F curve settings via nvcurve-gui</description>
+    <description xml:lang="tr">nvcurve-gui üzerinden NVIDIA GPU V/F eğrisi ayarlarını uygula</description>
+    <message>Administrator authentication required (NVIDIA curve optimizer)</message>
+    <message xml:lang="tr">Yönetici kimlik doğrulaması gerekiyor (NVIDIA eğri optimizasyonu)</message>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/nvcurve-root-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+  <action id="com.nvcurve.gui.sensors">
+    <description>Read NVIDIA GPU hotspot and memory temperatures (read-only)</description>
+    <description xml:lang="tr">NVIDIA GPU hotspot ve bellek sıcaklıklarını oku (salt okunur)</description>
+    <message>Authentication is required to read NVIDIA GPU sensors</message>
+    <message xml:lang="tr">NVIDIA GPU sensörlerini okumak için kimlik doğrulama gerekiyor</message>
+    <!-- Read-only, fixed register offsets, no input: the active local session gets it without a prompt. -->
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>yes</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/nvcurve-sensors</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

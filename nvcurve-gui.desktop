@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=NVIDIA Curve Optimizer
+GenericName=GPU V/F Curve Tuner
+Comment=Tune NVIDIA GPU voltage/frequency curves via nvcurve
+Exec=/usr/local/bin/nvcurve-gui
+Icon=nvcurve-gui
+Terminal=false
+Categories=Settings;System;
+StartupNotify=true

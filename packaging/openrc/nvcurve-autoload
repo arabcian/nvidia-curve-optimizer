@@ -1,0 +1,21 @@
+#!/sbin/openrc-run
+# Applies the default ("auto-load") NVIDIA V/F curve profile at boot.
+# Set from the GUI's ★ Default button (/etc/nvcurve/config.json).
+
+description="Apply the nvcurve auto-load GPU profile"
+command="@BINDIR@/nvcurve"
+
+depend() {
+	need localmount nvcurve-boot-guard
+	after modules udev nvidia-persistenced
+}
+
+start() {
+	if ! "@LIBEXEC@/nvcurve-boot-guard" check 2>/dev/null; then
+		ewarn "nvcurve boot-time profile paused after a crashed boot — resume it with: nvcurve-boot-guard reset"
+		return 0
+	fi
+	ebegin "Applying nvcurve auto-load profile"
+	NVCURVE_LOG=info "${command}" autoload
+	eend $?
+}

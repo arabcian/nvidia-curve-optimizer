@@ -161,6 +161,23 @@ fn inventory_mapping(handles: &[Gpu]) -> Result<Vec<InventoryIdentity>, String> 
     Ok(out)
 }
 
+/// NVML index of the GPU at NVAPI `index` (the public index). The two APIs may
+/// enumerate in different orders, so NVML-only writes must go through this.
+/// One GPU in both APIs is unambiguous; otherwise the verified inventory join
+/// decides, and an ambiguous layout fails closed.
+pub fn nvml_index(index: usize) -> Result<u32, String> {
+    init_nvapi().map_err(|e| e.to_string())?;
+    let handles = enumerate_gpus().map_err(|e| e.to_string())?;
+    let n = nvml::ready()?;
+    if index >= handles.len() { return Err(format!("GPU index {index} out of range (found {} GPU(s))", handles.len())); }
+    if handles.len() == 1 && n.device_count()? == 1 { return Ok(0); }
+    let uuid = &inventory_mapping(&handles)?[index].uuid;
+    for i in 0..n.device_count()? {
+        if &n.uuid(n.fresh_handle(i)?)? == uuid { return Ok(i); }
+    }
+    Err("GPU disappeared from NVML during index mapping".into())
+}
+
 /// Mixed CT/NVML profile writes still use same-index APIs. Until all setters
 /// and rollback paths use an explicit verified handle, refuse multi-GPU apply.
 /// Do not change the standalone emergency reset path here.

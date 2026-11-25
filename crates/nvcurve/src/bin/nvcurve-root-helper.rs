@@ -9,7 +9,7 @@
 
 use nvcurve::atomicio::{ensure_dir, write_bytes, write_json};
 use nvcurve::config::{Config, PERSISTENT_CONFIG_FILE};
-use nvcurve::hal::limits;
+use nvcurve::hal::{gpu, limits};
 use nvcurve::profiles::apply::run_autoload;
 use nvcurve::profiles::native::is_canonical_profile_name;
 use nvcurve::{logging, ops};
@@ -208,11 +208,12 @@ fn op_set_vram_memlock(p: &Obj) -> OpResult {
     let (Some(lo), Some(hi)) = (p.get("min_mhz").and_then(is_int), p.get("max_mhz").and_then(is_int)) else {
         return Err("min_mhz/max_mhz must be integers".into());
     };
-    if lo <= 0 || hi <= 0 || lo > hi || hi > nvcurve::safety::mem_clock_ceiling(0) {
+    let idx = gpu::nvml_index(0)?;
+    if lo <= 0 || hi <= 0 || lo > hi || hi > nvcurve::safety::mem_clock_ceiling(idx) {
         return Err("Invalid min_mhz/max_mhz range".into());
     }
-    limits::set_mem_locked_clocks(lo as u32, hi as u32, 0)?;
-    Ok(match limits::get_current_mem_clock(0) {
+    limits::set_mem_locked_clocks(lo as u32, hi as u32, idx)?;
+    Ok(match limits::get_current_mem_clock(idx) {
         Some(actual) if actual as i64 != hi => format!(
             "Requested lock: {lo}–{hi} MHz — driver resolved to {actual} MHz (nearest supported stock clock)."),
         _ => format!("Memory clock locked to {lo}–{hi} MHz."),
@@ -227,12 +228,12 @@ fn op_set_gpu_clocklock(p: &Obj) -> OpResult {
     if !(210..=4000).contains(&hi) || lo < 0 || lo > hi {
         return Err("max_mhz must be 210–4000 and min_mhz 0–max_mhz".into());
     }
-    limits::set_gpu_locked_clocks(lo as u32, hi as u32, 0)?;
+    limits::set_gpu_locked_clocks(lo as u32, hi as u32, gpu::nvml_index(0)?)?;
     Ok(format!("GPU core clock capped at {hi} MHz (until unlocked, reboot or driver reload)."))
 }
 
 fn op_reset_gpu_clocklock(_: &Obj) -> OpResult {
-    limits::reset_gpu_locked_clocks(0)?;
+    limits::reset_gpu_locked_clocks(gpu::nvml_index(0)?)?;
     Ok("GPU core clock unlocked (back to the V/F curve's own maximum).".into())
 }
 
@@ -258,7 +259,7 @@ fn op_nvreg_set(p: &Obj) -> OpResult {
 fn op_set_powermizer(p: &Obj) -> OpResult {
     let mode = p.get("mode").and_then(Value::as_str).ok_or("mode must be a string")?;
     if limits::power_mizer_mode_id(mode).is_none() { return Err(format!("unknown PowerMizer mode {mode:?}")); }
-    limits::set_power_mizer(0, mode)?;
+    limits::set_power_mizer(gpu::nvml_index(0)?, mode)?;
     Ok(format!("PowerMizer set to {mode}."))
 }
 
@@ -269,7 +270,7 @@ fn op_read_sensors(_: &Obj) -> OpResult {
 }
 
 fn op_reset_vram_memlock(_: &Obj) -> OpResult {
-    limits::reset_mem_locked_clocks(0)?;
+    limits::reset_mem_locked_clocks(gpu::nvml_index(0)?)?;
     Ok("Memory clock unlocked (returned to driver/P-state control).".into())
 }
 

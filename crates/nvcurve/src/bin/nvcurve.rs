@@ -392,8 +392,8 @@ fn cmd_profile(a: &Args, cfg: &Config) {
         Some("save") => {
             let n = need("save");
             require_root();
-            let idx = a.gpu();
             let (g, gname) = open_gpu(a);
+            let idx = gpu::nvml_index(a.gpu()).unwrap_or_else(|e| die(1, format!("nvcurve: {e}")));
             let s = vfcurve::read_curve(g, &gname).unwrap_or_else(|e| die(1, format!("Failed to read curve: {e}")));
             // GPU-core points only: the memory offset is saved as mem_offset_mhz (NVML); memory-domain
             // ClockBoostTable deltas would be applied on top of it.
@@ -403,8 +403,8 @@ fn cmd_profile(a: &Args, cfg: &Config) {
             let existing = profile_path(&cfg.profile_dir, n).filter(|p| p.exists()).and_then(|p| load_profile(&p).ok());
             let data = ProfileData {
                 name: n.into(), gpu_name: gname, curve_deltas,
-                mem_offset_mhz: limits::get_clock_offsets(idx as u32).mem_offset_mhz.map(i64::from),
-                power_limit_w: limits::get_power_limit(idx as u32).power_limit_w.map(i64::from),
+                mem_offset_mhz: limits::get_clock_offsets(idx).mem_offset_mhz.map(i64::from),
+                power_limit_w: limits::get_power_limit(idx).power_limit_w.map(i64::from),
                 mem_locked_min_mhz: existing.as_ref().and_then(|e| e.mem_locked_min_mhz),
                 mem_locked_max_mhz: existing.as_ref().and_then(|e| e.mem_locked_max_mhz),
                 gpu_clock_cap_mhz: existing.as_ref().and_then(|e| e.gpu_clock_cap_mhz),
@@ -431,7 +431,7 @@ fn cmd_profile(a: &Args, cfg: &Config) {
 // ── memlock ─────────────────────────────────────────────────────────────────
 
 fn cmd_memlock(a: &Args) {
-    let idx = a.gpu() as u32;
+    let idx = gpu::nvml_index(a.gpu()).unwrap_or_else(|e| die(1, format!("nvcurve: {e}")));
     match a.pos.get(1).map(String::as_str) {
         Some("status") => {
             let c = limits::get_supported_mem_clocks(idx);
@@ -507,7 +507,7 @@ fn cmd_sensors(a: &Args) {
 }
 
 fn cmd_powermizer(a: &Args) {
-    let idx = a.gpu() as u32;
+    let idx = gpu::nvml_index(a.gpu()).unwrap_or_else(|e| die(1, format!("nvcurve: {e}")));
     match a.pos.get(1).map(String::as_str) {
         Some("status") | None => match limits::get_power_mizer(idx) {
             Ok(p) => {

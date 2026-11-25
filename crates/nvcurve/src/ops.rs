@@ -182,7 +182,7 @@ pub fn reset_vf_offsets_verified(gpu_index: usize, domain: Option<crate::types::
 /// deliberately left untouched (Reset All handles those separately).
 pub fn reset_gpu_curve_verified(gpu_index: usize) -> Result<String, String> {
     let summary = reset_vf_offsets_verified(gpu_index, None)?;
-    match limits::reset_gpu_locked_clocks(gpu_index as u32) {
+    match gpu::nvml_index(gpu_index).and_then(limits::reset_gpu_locked_clocks) {
         Ok(()) => Ok(format!("{summary}; GPU cap released")),
         Err(e) if e.contains("Not Supported") || e.contains("not found") =>
             Ok(format!("{summary}; core lock API unavailable")),
@@ -196,11 +196,14 @@ pub fn reset_gpu_curve_verified(gpu_index: usize) -> Result<String, String> {
 /// attempted even if an earlier one fails; returns (done, errors).
 pub fn reset_everything(gpu_index: usize) -> (Vec<String>, Vec<String>) {
     let (mut done, mut errs) = (Vec::new(), Vec::new());
-    let idx = gpu_index as u32;
     match reset_gpu_curve_verified(gpu_index) {
         Ok(msg) => done.push(msg),
         Err(e) => { errs.push(format!("V/F reset: {e}")); return (done, errs); }
     }
+    let idx = match gpu::nvml_index(gpu_index) {
+        Ok(i) => i,
+        Err(e) => { errs.push(format!("NVML settings not reset: {e}")); return (done, errs); }
+    };
     match limits::reset_all_clock_offsets(idx) {
         Ok(v) if v.is_empty() => done.push("NVML clock offsets already 0 in every P-state".into()),
         Ok(v) => done.extend(v),

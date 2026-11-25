@@ -110,6 +110,15 @@ private:
     void startSensorStream();
     void stopSensorStream();
 
+    // GPU selection (multi-GPU): NVAPI index as `nvcurve gpus` lists it; every helper
+    // op carries it as `gpu_index`. NVML stats follow the same card by PCI bus id.
+    void loadGpus();
+    void selectGpu(int comboIndex);
+    void openGpuReaders();
+    QComboBox *gpuSelect_ = nullptr;
+    int gpuIndex_ = 0, gpuCount_ = 0;
+    QString gpuPci_, gpuUuid_;
+
     VfCurveWidget *vf_;
     QPushButton *observeButton_ = nullptr;
     QTimer *observeTimer_ = nullptr;

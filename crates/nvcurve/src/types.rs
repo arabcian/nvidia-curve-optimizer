@@ -74,6 +74,8 @@ pub struct GpuInfo {
     pub pci_bus_id: Option<u32>,
     pub pci_address: Option<String>,
     pub identity_evidence: Option<&'static str>,
+    /// NVML device index of this GPU (PCI-bus matched), when the join is unique.
+    pub nvml_index: Option<u32>,
 }
 
 impl GpuInfo {

@@ -41,6 +41,12 @@ reason (`power`, `thermal`, or `—` when the GPU boosts freely). Values come fr
 NVML; hotspot and per-partition VRAM temperatures on Blackwell need root and are
 read by `nvcurve-sensors` (no password for the active local session).
 
+With more than one NVIDIA GPU, a **GPU selector** opens the profile row. Everything
+in the tab (stats, curve, Apply, Reset, locks, PowerMizer, ★ Default) acts on the
+selected GPU; switching re-reads its curve. Switching is blocked while an operation
+or a trial is running, so a trial revert always reaches the card it was applied to.
+On the command line, `nvcurve gpus` lists the GPUs and `nvcurve --gpu N …` selects one.
+
 Below it, the profile row:
 
 - **Save As…** — store the current graph, memory offset, VRAM lock and core cap

@@ -69,7 +69,12 @@ nvidia-curve-optimizer/
 ## Features synced from Centurion (experimental)
 
 - **Verified GPU identity**: every apply is bound to the GPU (UUID, PCI address, driver, VBIOS) the
-  curve was read from; a changed or ambiguous (multi-GPU) topology refuses the write.
+  curve was read from; a changed or ambiguous topology refuses the write.
+- **Multi-GPU (e.g. dual NVIDIA)**: with more than one NVIDIA GPU the tab shows a GPU selector.
+  Like LACT, each NvAPI GPU is matched to its NVML device by PCI bus number, so curve (NvAPI) and
+  offsets / locks / PowerMizer (NVML) always reach the same card. The match must be a complete,
+  unique bijection with equal model names and unique UUIDs; otherwise writes are refused. Each GPU
+  has its own ★ Default (keyed by UUID), and `nvcurve --gpu N …` / `nvcurve gpus` work the same way.
 - **Verified writes**: apply / reset write a prepared table, read it back exactly and roll back on
   a mismatch; no blind retries after an Xid. Snapshots restore only checked per-point deltas.
 - **Flatten guard** and **Xid 154 hardening**: see `docs/NVCURVE-FLATTEN-SAFETY.md` and
@@ -108,7 +113,8 @@ This app and [Centurion](https://github.com/arabcian/centurion) can be installed
   `set_powermizer`, `read_sensors`, `write_nvcurve_profile`,
   `delete_nvcurve_profile`, `set_default_gpu_profile`, `run_gpu_autoload`) is a
   small JSON payload on stdin of `nvcurve-root-helper`, started through
-  `pkexec`. The helper is a strict allowlist dispatcher: profile names, profile
+  `pkexec`. The target GPU is `gpu_index` (the index `nvcurve gpus` prints;
+  absent = GPU 0). The helper is a strict allowlist dispatcher: profile names, profile
   schemas and ranges are validated before anything is written, and the limits
   are re-read live from the driver (see `SECURITY-CHANGELOG.md`).
 - The Blackwell hotspot / GDDR7 partition sensors need root; they come from

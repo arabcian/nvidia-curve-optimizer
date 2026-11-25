@@ -103,10 +103,12 @@ static int floorDiv(qint64 a, int b) { return int(std::floor(double(a) / b)); } 
 // go; here it is shut down whenever the tab is hidden.
 class Nvml {
 public:
-    static Nvml *open() {
+    /// `pci`: NVML bus id ("00000000:01:00.0") of the selected GPU; empty = device 0.
+    /// The PCI lookup is LACT's device_by_pci_bus_id: NVML indices are not NVAPI indices.
+    static Nvml *open(const QString &pci = {}) {
         void *h = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
         if (!h) return nullptr;
-        auto *n = new Nvml(h);
+        auto *n = new Nvml(h, pci.toLatin1());
         if (!n->ok_) { delete n; return nullptr; }
         return n;
     }
@@ -123,10 +125,11 @@ public:
         PowerMizer m{}; return pm_ && pm_(dev_, &m) == 0 ? std::optional(m) : std::nullopt;
     }
 private:
-    explicit Nvml(void *h) : lib_(h) {
+    Nvml(void *h, const QByteArray &pci) : lib_(h) {
         auto sym = [&](const char *n) { return dlsym(lib_, n); };
         auto init = reinterpret_cast<int (*)()>(sym("nvmlInit_v2"));
         auto byIdx = reinterpret_cast<int (*)(unsigned, void **)>(sym("nvmlDeviceGetHandleByIndex_v2"));
+        auto byPci = reinterpret_cast<int (*)(const char *, void **)>(sym("nvmlDeviceGetHandleByPciBusId_v2"));
         shutdown_ = reinterpret_cast<int (*)()>(sym("nvmlShutdown"));
         temp_ = reinterpret_cast<int (*)(void *, unsigned, unsigned *)>(sym("nvmlDeviceGetTemperature"));
         power_ = reinterpret_cast<int (*)(void *, unsigned *)>(sym("nvmlDeviceGetPowerUsage"));
@@ -136,7 +139,7 @@ private:
         if (!reasons_) reasons_ = reinterpret_cast<int (*)(void *, unsigned long long *)>(sym("nvmlDeviceGetCurrentClocksThrottleReasons"));
         pm_ = reinterpret_cast<int (*)(void *, PowerMizer *)>(sym("nvmlDeviceGetPowerMizerMode_v1"));
         if (!init || !byIdx || init() != 0) { shutdown_ = nullptr; return; }
-        ok_ = byIdx(0, &dev_) == 0;
+        ok_ = pci.isEmpty() ? byIdx(0, &dev_) == 0 : byPci && byPci(pci.constData(), &dev_) == 0;
     }
     void *lib_, *dev_ = nullptr;
     bool ok_ = false;
@@ -156,10 +159,11 @@ private:
 // temperatures come from GPU registers. All values are range-checked.
 class NvApiTemps {
 public:
-    static NvApiTemps *open() {
+    /// `index`: NVAPI physical GPU index (the helpers' `gpu_index`).
+    static NvApiTemps *open(int index = 0) {
         void *h = dlopen("libnvidia-api.so.1", RTLD_NOW | RTLD_LOCAL);
         if (!h) return nullptr;
-        auto *t = new NvApiTemps(h);
+        auto *t = new NvApiTemps(h, index);
         if (!t->gpu_) { delete t; return nullptr; }
         return t;
     }
@@ -180,14 +184,14 @@ private:
     static_assert(sizeof(Therm) == 168 && sizeof(RegOp) == 24 && sizeof(RegOps) == 6152);
 
     template <typename F> F fn(unsigned id) { return qi_ ? reinterpret_cast<F>(qi_(id)) : nullptr; }
-    explicit NvApiTemps(void *h) : lib_(h) {
+    NvApiTemps(void *h, int index) : lib_(h) {
         qi_ = reinterpret_cast<void *(*)(unsigned)>(dlsym(lib_, "nvapi_QueryInterface"));
         auto init = fn<int (*)()>(0x0150E828);
         auto enumGpus = fn<int (*)(void **, unsigned *)>(0xE5AC921F);
         if (!init || !enumGpus || init() != 0) return;
         void *gpus[64] = {};
         unsigned n = 0;
-        if (enumGpus(gpus, &n) == 0 && n > 0) gpu_ = gpus[0];
+        if (enumGpus(gpus, &n) == 0 && n <= 64 && index >= 0 && unsigned(index) < n) gpu_ = gpus[index];
         therm_ = fn<int (*)(void *, Therm *)>(0x65FE3AAD);
         reg_ = fn<int (*)(void *, RegOps *)>(0x2EB3C140);
     }
@@ -333,6 +337,11 @@ NvidiaTab::NvidiaTab(QWidget *parent) : QWidget(parent) {
     sv->addLayout(stats);
 
     auto *prow = new QHBoxLayout;
+    gpuSelect_ = new QComboBox;
+    gpuSelect_->setToolTip(tr("NVIDIA GPU this tab reads and writes (NVAPI index, matched to NVML by PCI bus)"));
+    gpuSelect_->setVisible(false);  // shown once a second GPU is found
+    connect(gpuSelect_, &QComboBox::activated, this, &NvidiaTab::selectGpu);
+    prow->addWidget(gpuSelect_);
     if (!theme::experimentalEnabled()) prow->addWidget(lbl("Profile:", theme::MUTED));
     auto *bSave = new QPushButton("Save As…");
     bSave->setObjectName("btnAccent");
@@ -824,13 +833,11 @@ void NvidiaTab::showEvent(QShowEvent *e) {
             }
         } else {
             QTimer::singleShot(0, this, &NvidiaTab::readCurve);
+            loadGpus();
         }
     }
     if (!qEnvironmentVariableIsEmpty("NVCURVE_GUI_FAKE")) return;
-    if (!nvml_) nvml_ = Nvml::open();
-    syncPowerMizer();
-    pollStats();
-    statsTimer_->start();
+    openGpuReaders();
 }
 
 void NvidiaTab::hideEvent(QHideEvent *e) {
@@ -846,6 +853,84 @@ void NvidiaTab::hideEvent(QHideEvent *e) {
         delete nvml_;  // release /dev/nvidia* so the dGPU can suspend
         nvml_ = nullptr;
     }
+}
+
+/// NVML stats and NvAPI temperatures for the selected GPU, opened only while visible.
+void NvidiaTab::openGpuReaders() {
+    // Several GPUs without a verified PCI join: show no stats rather than another card's.
+    if (!nvml_ && !(gpuCount_ > 1 && gpuPci_.isEmpty())) nvml_ = Nvml::open(gpuPci_);
+    syncPowerMizer();
+    pollStats();
+    statsTimer_->start();
+}
+
+/// `nvcurve gpus --json` as the user; the selector appears only with more than one GPU.
+void NvidiaTab::loadGpus() {
+    userhelper::runProgram(ownCli(), {QStringLiteral("gpus"), QStringLiteral("--json")}, {}, this, [this](const QJsonObject &reply) {
+        const QJsonArray gpus = reply.value("gpus").toArray();
+        if (!reply.value("ok").toBool() || gpus.isEmpty()) return;
+        gpuCount_ = int(gpus.size());
+        const QSignalBlocker block(gpuSelect_);
+        gpuSelect_->clear();
+        for (const QJsonValue &v : gpus) {
+            const QJsonObject g = v.toObject();
+            const QString pci = g.value("pci_address").toString();
+            gpuSelect_->addItem(QStringLiteral("GPU %1: %2%3").arg(g.value("index").toInt()).arg(g.value("name").toString(),
+                                pci.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(pci)), g);
+        }
+        gpuSelect_->setVisible(gpuCount_ > 1);
+        int row = 0;
+        for (int i = 0; i < gpuSelect_->count(); ++i)
+            if (gpuSelect_->itemData(i).toJsonObject().value("index").toInt() == gpuIndex_) row = i;
+        gpuSelect_->setCurrentIndex(row);
+        const QJsonObject g = gpuSelect_->itemData(row).toJsonObject();
+        gpuPci_ = g.value("pci_address").toString();
+        gpuUuid_ = g.value("uuid").toString();
+        if (gpuCount_ > 1) {
+            if (gpuPci_.isEmpty()) log(tr("⚠ Several NVIDIA GPUs, but NVAPI and NVML could not be matched by PCI bus; writes will be refused."));
+            // Stats were opened on NVML device 0 before the PCI join was known.
+            if (observeButton_->isChecked()) observeButton_->setChecked(false);
+            delete nvml_;
+            nvml_ = nullptr;
+            if (isVisible()) openGpuReaders();
+        }
+        refreshProfiles();
+    });
+}
+
+void NvidiaTab::selectGpu(int comboIndex) {
+    const QJsonObject g = gpuSelect_->itemData(comboIndex).toJsonObject();
+    const int index = g.value("index").toInt(-1);
+    if (index < 0 || index == gpuIndex_) return;
+    if (busy_ || trial_->running()) {  // a pending trial revert must reach the GPU it was applied to
+        log(tr("⏳ Finish the running operation or trial first."));
+        for (int i = 0; i < gpuSelect_->count(); ++i)
+            if (gpuSelect_->itemData(i).toJsonObject().value("index").toInt() == gpuIndex_) gpuSelect_->setCurrentIndex(i);
+        return;
+    }
+    gpuIndex_ = index;
+    gpuPci_ = g.value("pci_address").toString();
+    gpuUuid_ = g.value("uuid").toString();
+    // Recording, readers and the root sensor stream belong to the previous card.
+    if (observeButton_->isChecked()) observeButton_->setChecked(false);
+    stopSensorStream();
+    streamFailed_ = false;
+    streamAt_ = 0;
+    delete temps_;
+    temps_ = nullptr;
+    tempsTried_ = false;
+    delete nvml_;
+    nvml_ = nullptr;
+    for (QLabel *l : {hotspot_, vram_}) l->setToolTip(QString());
+    hotspot_->setText(QStringLiteral("Hotspot: -- °C"));
+    vram_->setText(QStringLiteral("VRAM: -- °C"));
+    // The curve on screen was read from the other GPU: it must not be applied here.
+    curveReadbackValid_ = false;
+    readGpuDevice_ = {};
+    log(tr("Selected %1.").arg(gpuSelect_->itemText(comboIndex)));
+    if (isVisible()) openGpuReaders();
+    refreshProfiles();
+    readCurve();
 }
 
 void NvidiaTab::pollStats() {
@@ -864,7 +949,7 @@ void NvidiaTab::pollStats() {
     }
     if (!tempsTried_) {
         tempsTried_ = true;
-        temps_ = NvApiTemps::open();
+        temps_ = NvApiTemps::open(gpuIndex_);
         blackwell_ = nvml_->architecture().value_or(0) >= 10;
         if (!temps_)
             for (QLabel *l : {hotspot_, vram_})
@@ -900,8 +985,17 @@ void NvidiaTab::startSensorStream() {
     connect(p, &QProcess::readyReadStandardOutput, this, [this, p] {
         QByteArray last;
         while (p->canReadLine()) last = p->readLine();
-        const QJsonObject o = QJsonDocument::fromJson(last).object();
-        if (o.isEmpty() || o.contains("error")) return;
+        const QJsonObject all = QJsonDocument::fromJson(last).object();
+        if (all.isEmpty() || all.contains("error")) return;
+        // Per-GPU entries by NVAPI index; an older helper only sends GPU 0 at top level.
+        QJsonObject o;
+        if (all.contains("gpus")) {
+            for (const QJsonValue &g : all.value("gpus").toArray())
+                if (g.toObject().value("index").toInt(-1) == gpuIndex_) o = g.toObject();
+        } else if (gpuIndex_ == 0) {
+            o = all;
+        }
+        if (o.isEmpty()) return;
         streamAt_ = QDateTime::currentMSecsSinceEpoch();
         const QJsonValue h = o.value("hotspot_c"), v = o.value("vram_c");
         hotspot_->setText(h.isDouble() ? QStringLiteral("Hotspot: %1 °C").arg(h.toInt()) : QStringLiteral("Hotspot: — °C"));
@@ -971,6 +1065,7 @@ void NvidiaTab::setBusy(bool b) {
     coreSpin_->setEnabled(!b && !curveModified_);
     pointSpin_->setEnabled(!b && !vf_->selection().isEmpty());
     profiles_->setEnabled(!b);
+    gpuSelect_->setEnabled(!b && !trial_->running());
     for (auto *spin : {coreCapSpin_, capCompSpin_, memSpin_, lockMinSpin_, lockMaxSpin_}) spin->setEnabled(!b);
     updateCurveHistory();
 }
@@ -1017,6 +1112,8 @@ bool NvidiaTab::runHelper(const QJsonObject &payload, const QString &okMsg, cons
     if (busy_) { log("⏳ Another operation is still running — please wait."); return false; }
     clearCurveHistory();
     setBusy(true);
+    QJsonObject request = payload;
+    if (!request.contains("gpu_index")) request["gpu_index"] = gpuIndex_;
     const QString op = payload.value("op").toString();
     const auto requestId = payload.value("request_id").toString();
     const bool tracked = !qEnvironmentVariableIsSet("NVCURVE_PGO_TRAIN") && !requestId.isEmpty() &&
@@ -1024,15 +1121,15 @@ bool NvidiaTab::runHelper(const QJsonObject &payload, const QString &okMsg, cons
     const auto journalPath = tracked ? curveJournalPath() : QString();
     QJsonObject tx;
     if (tracked) tx = {{"id",requestId},{"operation",op},{"time",QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},
-                   {"boot",bootId()},{"requested",payload},{"evidence",QJsonObject{{"status","pending"}}}};
+                   {"boot",bootId()},{"requested",request},{"evidence",QJsonObject{{"status","pending"}}}};
     const bool journaled = tracked && !journalPath.isEmpty() && QDir().mkpath(QFileInfo(journalPath).absolutePath()) && tunejournal::store(journalPath,tx,false);
     if (tracked && !journaled) log(tr("V/F transaction journal unavailable; existing history preserved."));
-    privileged::run(helperPath(), payload, this, [=, this](const privileged::Result &r) mutable {
+    privileged::run(helperPath(), request, this, [=, this](const privileged::Result &r) mutable {
         if (journaled) {
             const auto file = op == QStringLiteral("reset_gpu_curve") ? QStringLiteral("nvcurve_reset_result.json") : QStringLiteral("nvcurve_apply_result.json");
             const auto observed = r.ok() ? curvejournal::readResult(RUN_DIR + '/' + file) : QJsonObject{};
             tx["completed"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
-            tx["evidence"] = curvejournal::inspect(payload,observed,r.reached,r.ok());
+            tx["evidence"] = curvejournal::inspect(request,observed,r.reached,r.ok());
             if (!tunejournal::store(journalPath,tx,true)) log(tr("Could not record V/F reply; pending evidence preserved."));
         }
         setBusy(false);
@@ -1317,7 +1414,7 @@ void NvidiaTab::validateDraft() {
     const auto ids = pointIds_; const auto volts = pointVoltages_; const auto gpu = readGpuName_; const auto device = readGpuDevice_;
     vf_->setInvalidPoints({});
     setBusy(true);
-    userhelper::runProgram(ownCli(), {QStringLiteral("validate-draft")},
+    userhelper::runProgram(ownCli(), {QStringLiteral("--gpu"), QString::number(gpuIndex_), QStringLiteral("validate-draft")},
         {{"profile_data", data}, {"expected_gpu", gpu}, {"expected_points", expectedPoints}, {"expected_device",device}}, this,
         [this, data, ids, volts, gpu, device](const QJsonObject &reply) {
             setBusy(false);
@@ -1485,6 +1582,8 @@ QString NvidiaTab::defaultProfileName() const {
     if (!f.open(QIODevice::ReadOnly) || f.size() > 256 * 1024) return {};
     const QJsonObject c = QJsonDocument::fromJson(f.readAll()).object();
     const QJsonObject m = c.value("auto_load_profiles").toObject();
+    // Several GPUs: each default is keyed by its UUID (nvcurve set_default_profile).
+    if (gpuCount_ > 1) return gpuUuid_.isEmpty() ? QString() : m.value(gpuUuid_).toString();
     if (!m.isEmpty()) return m.begin().value().toString();
     return c.value("auto_load_profile").toString();
 }

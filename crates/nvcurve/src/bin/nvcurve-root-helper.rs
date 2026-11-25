@@ -65,7 +65,24 @@ fn write_result(file: &str, v: &Value, request: &Obj) {
 }
 
 fn refresh_result(file: &str, request: &Obj) {
-    if let Ok(v) = ops::read_curve_retry(0, 2) { write_result(file, &v, request); }
+    let Ok(gpu) = gpu_param(request) else { return };
+    if let Ok(mut v) = ops::read_curve_retry(gpu, 2) { v["gpu_index"] = json!(gpu); write_result(file, &v, request); }
+}
+
+/// Target GPU: `gpu_index` (NVAPI index, as `nvcurve gpus` lists it); absent = GPU 0.
+fn gpu_param(p: &Obj) -> Result<usize, String> {
+    match p.get("gpu_index") {
+        None => Ok(0),
+        Some(v) => v.as_u64().filter(|&i| i < 64).map(|i| i as usize)
+            .ok_or_else(|| "gpu_index must be an integer 0..63".to_string()),
+    }
+}
+
+/// NVML index of the requested GPU (PCI-bus matched; fails closed when ambiguous).
+fn nvml_param(p: &Obj) -> Result<u32, String> {
+    let gpu = gpu_param(p)?;
+    nvcurve::hal::gpu::init_nvapi().map_err(|e| e.to_string())?;
+    nvcurve::hal::gpu::nvml_index(gpu)
 }
 
 fn is_int(v: &Value) -> Option<i64> { v.as_i64().filter(|_| v.is_i64() || v.is_u64()) }
@@ -136,7 +153,9 @@ fn validate_profile_data(d: &Obj) -> Result<(), String> {
 // ── ops ─────────────────────────────────────────────────────────────────────
 
 fn op_read_gpu_curve(p: &Obj) -> OpResult {
-    let v = ops::read_curve_retry(0, 2).map_err(|e| format!("Failed to read V/F curve: {e}"))?;
+    let gpu = gpu_param(p)?;
+    let mut v = ops::read_curve_retry(gpu, 2).map_err(|e| format!("Failed to read V/F curve: {e}"))?;
+    v["gpu_index"] = json!(gpu);
     write_result(READ_RESULT, &v, p);
     Ok("Curve read successfully.".into())
 }
@@ -171,17 +190,19 @@ fn op_apply_gpu_offsets(p: &Obj) -> OpResult {
     let expected_gpu = p.get("expected_gpu").and_then(Value::as_str).ok_or("Missing expected GPU")?;
     let expected_points = p.get("expected_points").ok_or("Missing expected points")?;
     let expected_device = p.get("expected_device").filter(|v| v.is_object()).ok_or("Missing verified GPU identity; update GUI and read curve again")?;
-    let observed = ops::read_curve_retry(0, 2)?;
+    let gpu = gpu_param(p)?;
+    let observed = ops::read_curve_retry(gpu, 2)?;
     check_expected_curve(p, &observed)?;
     if &observed["device_identity"] != expected_device { return Err("GPU device identity changed; read curve again".into()); }
     ensure_dir(Path::new(PROFILES_DIR), 0o755).map_err(|e| format!("Could not prepare {PROFILES_DIR}: {e}"))?;
     write_bytes(&profile_file(name), text.as_bytes(), 0o644).map_err(|e| format!("Could not write profile: {e}"))?;
 
-    let out = nvcurve::profiles::apply::apply_profile_checked(0,name,&config(),Some((expected_gpu,expected_points,expected_device)))?;
+    let out = nvcurve::profiles::apply::apply_profile_checked(gpu,name,&config(),Some((expected_gpu,expected_points,expected_device)))?;
     if !out.errors.is_empty() { return Err(out.errors.join("; ")); }
     let mut msg = format!("Profile '{name}' applied and verified.");
     for warning in out.warnings { msg.push('\n'); msg.push_str(&warning); }
-    if let Ok(mut v) = ops::read_curve_retry(0, 2) {
+    if let Ok(mut v) = ops::read_curve_retry(gpu, 2) {
+        v["gpu_index"] = json!(gpu);
         // Receipt belongs to the actual checked apply, not the earlier Validate button.
         v["apply_plan"] = json!({"schema":1,"device_identity":expected_device,
             "points":out.point_plan,"scope":"gpu_point_plan_only"});
@@ -193,13 +214,13 @@ fn op_apply_gpu_offsets(p: &Obj) -> OpResult {
 fn op_apply_named_profile(p: &Obj) -> OpResult {
     let name = name_param(p, "name")?;
     if !profile_file(name).is_file() { return Err(format!("Profile not found: {name}")); }
-    let msg = ops::apply_profile_verified(0, name, &config(), 3).map_err(|e| format!("Apply failed: {e}"))?;
+    let msg = ops::apply_profile_verified(gpu_param(p)?, name, &config(), 3).map_err(|e| format!("Apply failed: {e}"))?;
     refresh_result(APPLY_RESULT, p);
     Ok(msg)
 }
 
 fn op_reset_gpu_curve(p: &Obj) -> OpResult {
-    let msg = ops::reset_gpu_curve_verified(0)?;
+    let msg = ops::reset_gpu_curve_verified(gpu_param(p)?)?;
     refresh_result(RESET_RESULT, p);
     Ok(msg)
 }
@@ -208,11 +229,12 @@ fn op_set_vram_memlock(p: &Obj) -> OpResult {
     let (Some(lo), Some(hi)) = (p.get("min_mhz").and_then(is_int), p.get("max_mhz").and_then(is_int)) else {
         return Err("min_mhz/max_mhz must be integers".into());
     };
-    if lo <= 0 || hi <= 0 || lo > hi || hi > nvcurve::safety::mem_clock_ceiling(0) {
+    let idx = nvml_param(p)?;
+    if lo <= 0 || hi <= 0 || lo > hi || hi > nvcurve::safety::mem_clock_ceiling(idx) {
         return Err("Invalid min_mhz/max_mhz range".into());
     }
-    limits::set_mem_locked_clocks(lo as u32, hi as u32, 0)?;
-    Ok(match limits::get_current_mem_clock(0) {
+    limits::set_mem_locked_clocks(lo as u32, hi as u32, idx)?;
+    Ok(match limits::get_current_mem_clock(idx) {
         Some(actual) if actual as i64 != hi => format!(
             "Requested lock: {lo}–{hi} MHz — driver resolved to {actual} MHz (nearest supported stock clock)."),
         _ => format!("Memory clock locked to {lo}–{hi} MHz."),
@@ -227,17 +249,17 @@ fn op_set_gpu_clocklock(p: &Obj) -> OpResult {
     if !(210..=4000).contains(&hi) || lo < 0 || lo > hi {
         return Err("max_mhz must be 210–4000 and min_mhz 0–max_mhz".into());
     }
-    limits::set_gpu_locked_clocks(lo as u32, hi as u32, 0)?;
+    limits::set_gpu_locked_clocks(lo as u32, hi as u32, nvml_param(p)?)?;
     Ok(format!("GPU core clock capped at {hi} MHz (until unlocked, reboot or driver reload)."))
 }
 
-fn op_reset_gpu_clocklock(_: &Obj) -> OpResult {
-    limits::reset_gpu_locked_clocks(0)?;
+fn op_reset_gpu_clocklock(p: &Obj) -> OpResult {
+    limits::reset_gpu_locked_clocks(nvml_param(p)?)?;
     Ok("GPU core clock unlocked (back to the V/F curve's own maximum).".into())
 }
 
 fn op_reset_all(p: &Obj) -> OpResult {
-    let (done, errs) = ops::reset_everything(0);
+    let (done, errs) = ops::reset_everything(gpu_param(p)?);
     refresh_result(RESET_RESULT, p);
     let mut msg = done.join("\n");
     if !errs.is_empty() { return Err(format!("{}{}{}", msg, if msg.is_empty() { "" } else { "\n" }, errs.join("; "))); }
@@ -258,18 +280,18 @@ fn op_nvreg_set(p: &Obj) -> OpResult {
 fn op_set_powermizer(p: &Obj) -> OpResult {
     let mode = p.get("mode").and_then(Value::as_str).ok_or("mode must be a string")?;
     if limits::power_mizer_mode_id(mode).is_none() { return Err(format!("unknown PowerMizer mode {mode:?}")); }
-    limits::set_power_mizer(0, mode)?;
+    limits::set_power_mizer(nvml_param(p)?, mode)?;
     Ok(format!("PowerMizer set to {mode}."))
 }
 
 /// Sensors that may need root on some drivers (register reads) — the GUI
 /// reads them in-process first and only falls back to this.
-fn op_read_sensors(_: &Obj) -> OpResult {
-    Ok(ops::sensors_json(0).to_string())
+fn op_read_sensors(p: &Obj) -> OpResult {
+    Ok(ops::sensors_json(gpu_param(p)?).to_string())
 }
 
-fn op_reset_vram_memlock(_: &Obj) -> OpResult {
-    limits::reset_mem_locked_clocks(0)?;
+fn op_reset_vram_memlock(p: &Obj) -> OpResult {
+    limits::reset_mem_locked_clocks(nvml_param(p)?)?;
     Ok("Memory clock unlocked (returned to driver/P-state control).".into())
 }
 
@@ -307,10 +329,11 @@ fn op_set_default_gpu_profile(p: &Obj) -> OpResult {
         if !profile_file(n).is_file() { return Err(format!("Profile not found: {n}")); }
         Some(n)
     };
-    ops::set_default_profile(0, name)?;
+    let gpu = gpu_param(p)?;
+    ops::set_default_profile(gpu, name)?;
     Ok(match name {
-        None => "Auto-load profile cleared for GPU 0.".into(),
-        Some(n) => format!("Auto-load profile set to '{n}' for GPU 0."),
+        None => format!("Auto-load profile cleared for GPU {gpu}."),
+        Some(n) => format!("Auto-load profile set to '{n}' for GPU {gpu}."),
     })
 }
 
@@ -415,6 +438,14 @@ mod tests {
         assert!(check_expected_curve(&o(json!({"expected_gpu":"A","expected_points":[[3,600000]]})), &observed).is_ok());
         assert!(check_expected_curve(&o(json!({"expected_gpu":"B","expected_points":[[3,600000]]})), &observed).is_err());
         assert!(check_expected_curve(&o(json!({"expected_gpu":"A","expected_points":[[4,600000]]})), &observed).is_err());
+    }
+    #[test]
+    fn gpu_index_param() {
+        assert_eq!(gpu_param(&o(json!({}))), Ok(0));
+        assert_eq!(gpu_param(&o(json!({"gpu_index": 1}))), Ok(1));
+        for bad in [json!(-1), json!(64), json!(1.5), json!("1"), json!(null)] {
+            assert!(gpu_param(&o(json!({"gpu_index": bad}))).is_err());
+        }
     }
     #[test]
     fn schema() {

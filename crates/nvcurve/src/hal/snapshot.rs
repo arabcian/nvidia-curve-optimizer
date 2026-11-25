@@ -144,14 +144,15 @@ pub fn restore(gpu: Gpu, dir: &str, filepath: Option<&str>) -> Result<(), String
         return Err("Snapshot metadata size does not match ClockBoostTable".into());
     }
     let handles = gpu::enumerate_gpus().map_err(|e| e.to_string())?;
-    if handles.as_slice() != [gpu] {
-        return Err("Snapshot restore requires unambiguous single-GPU identity; multi-GPU restore is not verified".into());
+    let index = handles.iter().position(|&h| h == gpu).ok_or("Snapshot target GPU is no longer enumerated")?;
+    if handles.len() > 1 && !meta["gpu_uuid"].is_string() {
+        return Err("Snapshot has no GPU UUID; multi-GPU restore needs one".into());
     }
     if meta.get("identity_schema").is_some() && (meta["identity_schema"].as_u64() != Some(1) || !meta["gpu_uuid"].is_string()) {
         return Err("Snapshot has no verified GPU UUID or has an unsupported identity schema".into());
     }
     if let Some(expected_uuid) = meta["gpu_uuid"].as_str() {
-        let identity = gpu::curve_device_identity(0,gpu,&live_name)?;
+        let identity = gpu::curve_device_identity(index,gpu,&live_name)?;
         let got = identity["uuid"].as_str().ok_or("GPU UUID unavailable")?;
         if got != expected_uuid { return Err(format!("Snapshot GPU UUID {expected_uuid} != active {got}")); }
     }

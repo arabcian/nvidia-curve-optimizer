@@ -10,14 +10,17 @@ class Invariants(unittest.TestCase):
         ops=src('crates/nvcurve/src/ops.rs'); root=src('crates/nvcurve/src/bin/nvcurve-root-helper.rs')
         j=src('gui/src/curvejournal.h'); n=src('gui/src/nvidiatab.cpp')
         self.assertIn('bus_mapping(&api, &buses)',g)
-        self.assertIn('unique_bus_inventory_only',g)
+        self.assertIn('"mapping":"unique_pci_bus"',g)
+        self.assertIn('pub fn nvml_index(index: usize) -> Result<u32, String>',g)
         self.assertIn('capture()? != ml',g)
         self.assertNotIn('nv.handle(i as u32)',g)
         body=a[a.index('pub fn apply_profile_checked('):a.index('pub fn apply_with_retry(')]
-        self.assertLess(body.index('gpu::require_single_profile_target(gpu_index)?'),body.index('vfcurve::write_prepared_offsets(g, &changes'))
+        self.assertLess(body.index('if gpu::require_profile_target(gpu_index)? != idx'),body.index('vfcurve::write_prepared_offsets(g, &changes'))
+        self.assertNotIn('gpu_index as u32',a)
+        self.assertNotIn('gpu_index as u32',ops)
         self.assertIn('out.point_plan = state.points.iter()',body)
         self.assertIn('"points":out.point_plan',root)
-        self.assertIn('device_before.is_none() || device_before != device_after',ops)
+        self.assertIn('nvml_idx.is_none() || device_before != device_after',ops)
         self.assertIn('curveplan::validate(layout,points)',j)
         self.assertIn('plan->at(index)',j)
         self.assertIn('curvejournal::preparedPlan(result,*identity)',n)
@@ -66,7 +69,7 @@ class Invariants(unittest.TestCase):
         self.assertIn('ops::apply_profile_verified(a.gpu(), n, cfg, 1)',cli)
         self.assertIn('let out = apply_profile(gpu_index, name, cfg)?;',ops)
         self.assertIn('match crate::ops::apply_profile_verified(gpu_index, name, cfg, 1)',app)
-        self.assertIn('ops::apply_profile_verified(0, name, &config(), 3)',root)
+        self.assertIn('ops::apply_profile_verified(gpu_param(p)?, name, &config(), 3)',root)
         self.assertNotIn('vfcurve::reset_all_offsets(g, false);\n    if rc != 0 { return Err(format!("Reset failed',ops)
         self.assertNotIn('std::thread::sleep(',app)
 
@@ -129,7 +132,7 @@ class Invariants(unittest.TestCase):
         self.assertIn('vfcurve::verify_readback(&zero, &now)',s)
         self.assertIn('ops::reset_vf_offsets_verified(a.gpu(), domain)',src('crates/nvcurve/src/bin/nvcurve.rs'))
         self.assertIn('Err(e) => { errs.push(format!("V/F reset: {e}")); return (done, errs); }',s)
-        self.assertIn('ops::reset_gpu_curve_verified(0)',root)
+        self.assertIn('ops::reset_gpu_curve_verified(gpu_param(p)?)',root)
 
     def test_gui_profile_offset_parsing(self):
         s=src('gui/src/nvidiatab.cpp')

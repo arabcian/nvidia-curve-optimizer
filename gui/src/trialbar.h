@@ -1,5 +1,5 @@
 #pragma once
-// Trial apply for the curve tab: with "Trial apply" ticked, a successful apply
+// Trial apply for the curve tabs (NVIDIA, Ryzen, Intel): with "Trial apply" ticked, a successful apply
 // starts a countdown; unless Keep is pressed in time, the tab's reset runs (curve back to stock).
 // Same idea as the AMD GPU tab's trial. Protects against a curve that makes the desktop unusable but
 // leaves the machine running (artefacts, a hung game, a black window); a hard freeze or reboot already

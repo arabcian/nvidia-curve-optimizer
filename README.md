@@ -53,7 +53,7 @@ proprietary driver.
 ```
 nvidia-curve-optimizer/
 ├── gui/                       # Qt6 GUI (C++20): curve tab, graph widget, trial bar, theme system
-│   ├── src/                   #   main.cpp  nvidiatab.*  vfcurvewidget.*  trialbar.*  theme.*  privileged.*  icon.*
+│   ├── src/                   #   main.cpp  nvidiatab.*  vfcurvewidget.*  trialbar.*  nvregdialog.*  theme.*  privileged.*  icon.*
 │   └── data/                  #   theme glyphs, app icon (SVG)
 ├── crates/nvcurve/            # Rust core: NvAPI/NVML (dlopen) HAL, safety limits, profiles, root helpers
 │   └── src/bin/               #   nvcurve (CLI)  nvcurve-root-helper  nvcurve-sensors  nvcurve-boot-guard
@@ -65,6 +65,21 @@ nvidia-curve-optimizer/
 ├── USAGE.md  SECURITY-CHANGELOG.md  LICENSE  NOTICE
 └── Cargo.toml  Cargo.lock
 ```
+
+## Features synced from Centurion (experimental)
+
+- **Verified GPU identity**: every apply is bound to the GPU (UUID, PCI address, driver, VBIOS) the
+  curve was read from; a changed or ambiguous (multi-GPU) topology refuses the write.
+- **Verified writes**: apply / reset write a prepared table, read it back exactly and roll back on
+  a mismatch; no blind retries after an Xid. Snapshots restore only checked per-point deltas.
+- **Flatten guard** and **Xid 154 hardening**: see `docs/NVCURVE-FLATTEN-SAFETY.md` and
+  `docs/NVCURVE-XID154-HARDENING.md`.
+- **Curve editor**: undo / redo, reference curves (base / read-back), invalid-point markers, a draft
+  validator and a transaction history of recent applies.
+- **Driver options**: the NVIDIA tab's *Driver options…* dialog edits a validated set of `nvidia` /
+  `nvidia_drm` module options in `/etc/modprobe.d/zz-nvcurve-nvidia.conf` (applies at next boot).
+- **Sensor safety**: Blackwell hotspot / VRAM register reads skip a sample while a GPU write holds
+  the lock, and never re-probe absent memory partitions.
 
 ## Architecture
 

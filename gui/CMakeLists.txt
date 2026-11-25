@@ -18,6 +18,9 @@ add_executable(nvcurve-gui
     src/vfcurvewidget.cpp src/vfcurvewidget.h
     src/nvidiatab.cpp    src/nvidiatab.h
     src/trialbar.cpp     src/trialbar.h
+    src/nvregdialog.cpp  src/nvregdialog.h
+    src/userhelper.cpp   src/userhelper.h
+    src/charts.cpp       src/charts.h
 )
 # Theme glyphs (checkbox tick, spin/combo chevrons), @2x for HiDPI. Compiled
 # with qt_add_resources, not AUTORCC: CMake's Makefile generator runs the

@@ -96,6 +96,14 @@ Voltage (mV) on the X axis, frequency (MHz) on the Y axis.
 - **Reset All** — everything back to stock: curve offsets, NVML offsets in every
   P-state, core and VRAM clock locks, power limit, PowerMizer → Auto (asks first).
 
+### Driver options
+
+*Driver options…* (next to the profile buttons) lists the managed `nvidia` / `nvidia_drm` module
+options with their running value, where else they are set, and the value nvcurve manages. *Apply
+(next boot)* rewrites `/etc/modprobe.d/zz-nvcurve-nvidia.conf` through the polkit-gated root helper;
+rebuild the initramfs if it carries the nvidia modules. A row left on *not set* keeps the driver
+default.
+
 ### Log
 
 Every operation's result — successes, errors, and warnings the core reports (for

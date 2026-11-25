@@ -1,8 +1,9 @@
 #pragma once
-// NVIDIA Curve Optimizer tab.
+// NVIDIA Curve Optimizer tab — port of nvcurve_gui.py (embedded mode).
 // Reads/applies the V/F curve, memory offset and VRAM lock through
 // nvcurve-root-helper; live stats via NVML (dlopen, only while visible).
 #include <QHash>
+#include <QList>
 #include <QJsonObject>
 #include <QPointF>
 #include <QSet>
@@ -34,7 +35,7 @@ public:
     QStringList profileNames() const;
     QString defaultProfileName() const;
     bool busy() const { return busy_; }
-    /// Apply a saved profile by name (no JSON rewrite).
+    /// Tray quick-apply: apply a saved profile by name (no JSON rewrite).
     void applyNamedProfile(const QString &name);
     void resetCurve();
 
@@ -52,6 +53,21 @@ private:
     void log(const QString &s);
 
     // model
+    struct CurveDraft {
+        QHash<int, int> offsets;
+        int core, flatFrom, flatMhz, cap;
+        bool modified;
+        bool operator==(const CurveDraft &) const = default;
+    };
+    CurveDraft curveDraft() const;
+    void rememberCurveEdit();
+    void clearCurveHistory();
+    void updateCurveHistory();
+    void restoreCurveDraft(bool redo);
+    QList<CurveDraft> undoCurve_, redoCurve_;
+    bool restoringCurve_ = false;
+    int previousCap_ = 209;
+    QPushButton *undoCurveBtn_ = nullptr, *redoCurveBtn_ = nullptr;
     void recompute();
     // Never below -base: the graph clamps there too, so what Apply sends is what the graph shows.
     /// First point the core offset applies to — LACT's curve shift: its editor works on the
@@ -65,7 +81,8 @@ private:
     void updateCoreOffsetUi();
     void onSelectionChanged();
     void resetGraphToLastRead();
-    bool loadCurveFile(const QString &file, qint64 notBeforeMs, QJsonArray *out);
+    bool loadCurveFile(const QString &file, const QString &requestId, QJsonArray *out, const QJsonObject &expectedDevice = {}, QJsonObject *result = nullptr);
+    void showCurveTransactions();
     void applyMemOffset(const QJsonObject &result);
     void takeGpuPoints(const QJsonArray &pts, bool keepOffsets);
     void adoptOffsets(const QHash<int, int> &offs);
@@ -75,6 +92,8 @@ private:
     // actions
     void readCurve();
     void applyOffsets();
+    QJsonObject draftProfileData() const;
+    void validateDraft();
     void vramLock();
     void vramUnlock();
     void saveProfileAs();
@@ -112,6 +131,12 @@ private:
     QVector<QPointF> base_;          // (mV, base MHz) of GPU-domain points
     QHash<int, int> pointOffsets_;   // per-point MHz, on top of coreOffset_
     QHash<int, int> readOffsets_;
+    QString readSnapshotTime_;
+    QVector<int> pointIds_;
+    QVector<qint64> pointVoltages_;
+    QString readGpuName_;
+    QJsonObject readGpuDevice_;
+    bool curveReadbackValid_ = false;
     QVector<int> readFreq_;          // MHz each GPU point actually ran at in the last read
     int coreOffset_ = 0;
     bool curveModified_ = false;
@@ -126,4 +151,5 @@ private:
     bool flattenPending() const { return flatFrom_ >= 0 && flatFrom_ < base_.size(); }
     TrialBar *trial_ = nullptr;  // "Trial apply": auto-revert unless kept
     void revertTrial();
+    void resetCurveImpl(bool fromTrial);
 };

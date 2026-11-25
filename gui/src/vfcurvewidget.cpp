@@ -1,6 +1,10 @@
 #include "vfcurvewidget.h"
 #include "theme.h"
+#include "charts.h"
+#include <QContextMenuEvent>
+#include <QMenu>
 #include <QKeyEvent>
+#include <QFontMetrics>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
@@ -12,6 +16,9 @@ static QColor C(const char *s) { return QColor(QString::fromLatin1(s)); }
 
 VfCurveWidget::VfCurveWidget(QWidget *parent) : QWidget(parent) {
     setFocusPolicy(Qt::StrongFocus);
+    setAccessibleName(tr("V/F curve editor"));
+    setAccessibleDescription(tr("Voltage/frequency points. Left/Right extend the selection, Up/Down change the "
+                                "selected points by 1 MHz (Shift: 15), Ctrl+A selects all, Esc clears."));
     setMinimumHeight(200);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     setMouseTracking(true);  // hover highlight
@@ -22,6 +29,20 @@ static double niceStep(double range, int targetTicks) {
     const double mag = std::pow(10.0, std::floor(std::log10(raw)));
     for (double m : {1.0, 2.0, 2.5, 5.0, 10.0}) if (m * mag >= raw) return m * mag;
     return 10 * mag;
+}
+
+void VfCurveWidget::setReferenceCurves(const QVector<QPointF> &base, const QVector<QPointF> &readback) {
+    baseRef_ = base;
+    readRef_ = readback;
+    if (!pts_.isEmpty()) applyView();
+    update();
+}
+
+void VfCurveWidget::setReferenceVisibility(bool base, bool readback) {
+    showBase_ = base;
+    showRead_ = readback;
+    if (!pts_.isEmpty()) applyView();
+    update();
 }
 
 void VfCurveWidget::fitAxes() {
@@ -42,6 +63,9 @@ void VfCurveWidget::applyView() {
     if (zoom_ <= 1.0001) {
         yMin_ = 0;
         yMax_ = fullY1_;
+        for (const auto &pt : pts_) yMax_ = std::max(yMax_, pt.y() + 100);
+        if (showBase_) for (const auto &pt : baseRef_) yMax_ = std::max(yMax_, pt.y() + 100);
+        if (showRead_) for (const auto &pt : readRef_) yMax_ = std::max(yMax_, pt.y() + 100);
     } else {
         // Frequency follows the visible points, otherwise a zoomed-in
         // stretch of the curve would be a flat line at the top.
@@ -51,6 +75,13 @@ void VfCurveWidget::applyView() {
             lo = std::min(lo, p.y());
             hi = std::max(hi, p.y());
         }
+        const auto include = [&](const QVector<QPointF> &ref) {
+            for (const auto &pt : ref) if (pt.x() >= xMin_ - 1 && pt.x() <= xMax_ + 1) {
+                lo = std::min(lo, pt.y()); hi = std::max(hi, pt.y());
+            }
+        };
+        if (showBase_) include(baseRef_);
+        if (showRead_) include(readRef_);
         if (lo > hi) { yMin_ = 0; yMax_ = fullY1_; }
         else {
             const double pad = std::max(60.0, (hi - lo) * 0.15);
@@ -100,11 +131,18 @@ void VfCurveWidget::wheelEvent(QWheelEvent *e) {
 
 void VfCurveWidget::setPoints(const QVector<QPointF> &pts) {
     const bool reshaped = pts.size() != pts_.size();
+    invalidPoints_.clear();
     pts_ = pts;
     if (reshaped) { sel_.clear(); cur_ = 0; anchor_ = 0; band_ = false; fitAxes(); }
-    else if (zoom_ > 1.0001 && dragIndex_ < 0 && !groupDrag_) applyView();  // keep edited points in frame
+    else if (dragIndex_ < 0 && !groupDrag_) applyView();  // keep edited points in frame
     update();
     Q_EMIT selectionChanged();
+}
+
+void VfCurveWidget::setInvalidPoints(const QSet<int> &indices) {
+    invalidPoints_.clear();
+    for (int i : indices) if (i >= 0 && i < pts_.size()) invalidPoints_.insert(i);
+    update();
 }
 
 void VfCurveWidget::setCapComp(int capMhz, int compMhz) {
@@ -162,7 +200,12 @@ void VfCurveWidget::clearSelection() {
     Q_EMIT selectionChanged();
 }
 
-QRectF VfCurveWidget::plotRect() const { return QRectF(52, 10, width() - 62, height() - 44); }
+QRectF VfCurveWidget::plotRect() const {
+    const QFontMetrics fm(font());
+    const int left = std::max(52, fm.horizontalAdvance(QStringLiteral("00000")) + fm.height() + 12);
+    const int bottom = std::max(44, fm.height() * 2 + 10);
+    return QRectF(left, 10, std::max(1, width() - left - 12), std::max(1, height() - bottom - 10));
+}
 
 QPointF VfCurveWidget::toPixel(QPointF v) const {
     const QRectF r = plotRect();
@@ -177,10 +220,14 @@ QPointF VfCurveWidget::toValue(QPointF px) const {
 }
 
 int VfCurveWidget::hitTest(QPointF px) const {
+    const auto area=plotRect();
+    if(!area.contains(px))return -1;
     int best = -1;
     double bestD = 16 * 16;  // px radius
     for (int i = 0; i < pts_.size(); ++i) {
-        const QPointF d = toPixel(pts_[i]) - px;
+        const QPointF point=toPixel(pts_[i]);
+        if(!area.contains(point))continue;
+        const QPointF d = point - px;
         const double dd = d.x() * d.x() + d.y() * d.y();
         if (dd < bestD) { bestD = dd; best = i; }
     }
@@ -257,6 +304,16 @@ void VfCurveWidget::paintEvent(QPaintEvent *) {
         p.drawText(QRectF(r.right() - 64, y1 - 14, 60, 12), Qt::AlignRight | Qt::AlignBottom,
                    QStringLiteral("+%1").arg(compMhz_));
     }
+    const auto reference = [&](const QVector<QPointF> &points, const char *color, Qt::PenStyle style) {
+        if (points.isEmpty()) return;
+        QPainterPath ref(toPixel(points.first()));
+        for (int i = 1; i < points.size(); ++i) ref.lineTo(toPixel(points[i]));
+        p.setPen(QPen(C(color), 1.6, style));
+        p.setBrush(Qt::NoBrush);
+        p.drawPath(ref);
+    };
+    if (showBase_) reference(baseRef_, theme::MUTED, Qt::DashLine);
+    if (showRead_) reference(readRef_, theme::PURPLE, Qt::DotLine);
     QPainterPath path(toPixel(pts_[0]));
     for (int i = 1; i < pts_.size(); ++i) path.lineTo(toPixel(pts_[i]));
     p.setPen(QPen(C(theme::ACCENT), 2.2));
@@ -292,6 +349,13 @@ void VfCurveWidget::paintEvent(QPaintEvent *) {
         p.setBrush(sel_.contains(hover_) ? C(theme::WARN) : C(theme::ACCENT));
         p.drawEllipse(toPixel(pts_[hover_]), 7.5, 7.5);
     }
+    // Cross markers remain distinct from editable selection, even without colour.
+    p.setPen(QPen(C(theme::DANGER), 2.5));
+    for (int i : invalidPoints_) {
+        const auto px = toPixel(pts_[i]);
+        p.drawLine(px + QPointF(-8, -8), px + QPointF(8, 8));
+        p.drawLine(px + QPointF(-8, 8), px + QPointF(8, -8));
+    }
     if (band_) {
         QColor fill = C(theme::ACCENT);
         fill.setAlpha(40);
@@ -307,6 +371,7 @@ void VfCurveWidget::paintEvent(QPaintEvent *) {
 }
 
 void VfCurveWidget::mousePressEvent(QMouseEvent *e) {
+    if(e->button()!=Qt::LeftButton || !plotRect().contains(e->position())){e->ignore();return;}
     setFocus();
     const int hit = hitTest(e->position());
     const bool ctrl = e->modifiers() & Qt::ControlModifier;
@@ -365,7 +430,7 @@ void VfCurveWidget::mouseMoveEvent(QMouseEvent *e) {
     }
     if (band_) {
         bandEnd_ = e->position();
-        const QRectF box = QRectF(bandStart_, bandEnd_).normalized();
+        const QRectF box = QRectF(bandStart_, bandEnd_).normalized().intersected(plotRect());
         QSet<int> s = bandBase_;
         for (int i = 0; i < pts_.size(); ++i) if (box.contains(toPixel(pts_[i]))) s.insert(i);
         if (s != sel_) { sel_ = s; Q_EMIT selectionChanged(); }
@@ -388,7 +453,8 @@ void VfCurveWidget::leaveEvent(QEvent *e) {
     if (hover_ >= 0) { hover_ = -1; unsetCursor(); update(); }
 }
 
-void VfCurveWidget::mouseReleaseEvent(QMouseEvent *) {
+void VfCurveWidget::mouseReleaseEvent(QMouseEvent *e) {
+    if(e->button()!=Qt::LeftButton){e->ignore();return;}
     if (dragIndex_ >= 0) Q_EMIT pointEdited(dragIndex_, int(std::lround(dragFreq_)));
     dragIndex_ = -1;
     groupDrag_ = false;
@@ -423,4 +489,33 @@ void VfCurveWidget::keyPressEvent(QKeyEvent *e) {
     default: return QWidget::keyPressEvent(e);
     }
     update();
+}
+
+void VfCurveWidget::contextMenuEvent(QContextMenuEvent *e) {
+    if(pts_.isEmpty()||dragIndex_>=0||groupDrag_||band_)return;
+    // Freeze the displayed curves before any nested modal event loop.
+    const auto draft=pts_,base=baseRef_,read=readRef_;
+    const auto invalid=invalidPoints_,selection=sel_;
+    const double lo=xMin_,hi=xMax_;
+    QMenu menu(this);
+    auto *table=menu.addAction(tr("Inspect visible curve points"));
+    auto *visible=menu.addAction(tr("Export visible curve points"));
+    auto *all=menu.addAction(tr("Export all curve points"));
+    const auto chosen=menu.exec(e->globalPos());if(!chosen)return;
+    QList<QStringList> rows;
+    const auto num=[](double n){return std::isfinite(n)?QString::number(n,'g',17):QString();};
+    // Only same-length, same-voltage displayed reference layouts can be aligned.
+    // This is presentation, not a hardware identity or Apply validation.
+    const auto aligned=[&draft](const QVector<QPointF> &ref){
+        if(ref.size()!=draft.size())return false;
+        for(qsizetype i=0;i<draft.size();++i)if(!std::isfinite(ref[i].x())||ref[i].x()!=draft[i].x())return false;
+        return true;
+    };
+    const bool b=aligned(base),r=aligned(read);
+    for(qsizetype i=0;i<draft.size();++i){
+        const auto p=draft[i];if(chosen!=all&&(p.x()<lo||p.x()>hi))continue;
+        rows.append(QStringList{QString::number(i),num(p.x()),num(p.y()),b?num(base[i].y()):QString(),r?num(read[i].y()):QString(),b?num(p.y()-base[i].y()):QString(),r?num(read[i].y()-p.y()):QString(),selection.contains(int(i))?QStringLiteral("1"):QStringLiteral("0"),invalid.contains(int(i))?QStringLiteral("1"):QStringLiteral("0")});
+    }
+    if(chosen==table)chartdata::table(this,{tr("Display index"),tr("Voltage (mV)"),tr("Draft (MHz)"),tr("Base (MHz)"),tr("Readback (MHz)"),tr("Draft − base (MHz)"),tr("Readback − draft (MHz)"),tr("Selected (0/1)"),tr("Validator marker (0/1)")},rows);
+    else chartdata::exportRows(this,QStringLiteral("display_index,voltage_mv,draft_mhz,base_mhz,readback_mhz,draft_minus_base_mhz,readback_minus_draft_mhz,selected,validator_marker"),rows,0);
 }

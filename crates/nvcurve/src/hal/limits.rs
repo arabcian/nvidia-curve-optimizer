@@ -328,8 +328,9 @@ pub struct MemOffsetRange {
     pub max_mem_offset_mhz: i32,
 }
 
-/// Allowed memory offset range in effective MHz; falls back to the observed
-/// RTX 5090 values (-500/+1500) if NVML can't report it.
+/// Allowed memory offset range in effective MHz; falls back to -500/+1500
+/// (a common GeForce range, first observed on an RTX 5090) if NVML can't
+/// report it, e.g. on drivers without nvmlDeviceGetMemClkMinMaxVfOffset.
 pub fn get_mem_offset_range(gpu_index: u32) -> MemOffsetRange {
     let mut out = MemOffsetRange { min_mem_offset_mhz: -500, max_mem_offset_mhz: 1500 };
     if let Ok(n) = nvml::ready() {

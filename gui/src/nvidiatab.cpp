@@ -171,7 +171,8 @@ public:
     std::optional<int> vram(bool blackwell) {
         if (!blackwell) return channel(15);
         if (auto p = partitionsMax()) return p;
-        return channel(10);
+        if (auto c = channel(10)) return c;
+        return channel(15);  // GDDR6 Blackwell boards (e.g. RTX 5050)
     }
 private:
     struct Therm { unsigned version; int mask; int values[40]; };

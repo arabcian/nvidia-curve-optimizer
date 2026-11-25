@@ -12,12 +12,12 @@
 
 namespace navigationtargets {
 struct Entry { QString id, title, aliases; };
-inline constexpr const char *Id = "centurionNavigationId";
+inline constexpr const char *Id = "nvcurveNavigationId";
 inline void mark(QWidget *w, const QString &id, const QString &title, const QString &aliases = {}) {
     if (!w || id.isEmpty() || id.size() > 512) return;
     w->setProperty(Id, id);
-    w->setProperty("centurionNavigationTitle", title);
-    w->setProperty("centurionNavigationAliases", aliases);
+    w->setProperty("nvcurveNavigationTitle", title);
+    w->setProperty("nvcurveNavigationAliases", aliases);
 }
 // Removed tab contents can survive until deleteLater. Retire their IDs before
 // the replacement editor is built, without changing QObject ownership.
@@ -36,7 +36,7 @@ inline QList<Entry> entries(QWidget *page) {
         if (id.isEmpty()) continue;
         if (seen.contains(id)) { ambiguous.insert(id); continue; }
         seen.insert(id);
-        if (out.size() < 2048) out.append({id, w->property("centurionNavigationTitle").toString(), w->property("centurionNavigationAliases").toString()});
+        if (out.size() < 2048) out.append({id, w->property("nvcurveNavigationTitle").toString(), w->property("nvcurveNavigationAliases").toString()});
     }
     out.removeIf([&](const Entry &e) { return ambiguous.contains(e.id); });
     return out;

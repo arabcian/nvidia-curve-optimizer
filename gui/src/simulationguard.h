@@ -41,7 +41,7 @@ inline bool installFilter() {
     // Block the x32 ABI as well: its syscall numbers have an extra high bit.
     // The process may create threads and internal socketpairs, but cannot
     // execute another program or open/connect external sockets.
-#define CENTURION_DENY(n) BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_##n, 0, 1), BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM)
+#define NVCURVE_DENY(n) BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_##n, 0, 1), BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM)
     struct sock_filter code[] = {
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
@@ -49,22 +49,22 @@ inline bool installFilter() {
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
         BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000U, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
-        CENTURION_DENY(execve), CENTURION_DENY(execveat),
-        CENTURION_DENY(socket), CENTURION_DENY(connect),
-        CENTURION_DENY(mount), CENTURION_DENY(umount2), CENTURION_DENY(pivot_root),
-        CENTURION_DENY(setns), CENTURION_DENY(unshare), CENTURION_DENY(ptrace),
-        CENTURION_DENY(process_vm_writev), CENTURION_DENY(bpf), CENTURION_DENY(reboot),
-        CENTURION_DENY(kexec_load),
+        NVCURVE_DENY(execve), NVCURVE_DENY(execveat),
+        NVCURVE_DENY(socket), NVCURVE_DENY(connect),
+        NVCURVE_DENY(mount), NVCURVE_DENY(umount2), NVCURVE_DENY(pivot_root),
+        NVCURVE_DENY(setns), NVCURVE_DENY(unshare), NVCURVE_DENY(ptrace),
+        NVCURVE_DENY(process_vm_writev), NVCURVE_DENY(bpf), NVCURVE_DENY(reboot),
+        NVCURVE_DENY(kexec_load),
 #ifdef __NR_kexec_file_load
-        CENTURION_DENY(kexec_file_load),
+        NVCURVE_DENY(kexec_file_load),
 #endif
-        CENTURION_DENY(init_module), CENTURION_DENY(finit_module), CENTURION_DENY(delete_module),
+        NVCURVE_DENY(init_module), NVCURVE_DENY(finit_module), NVCURVE_DENY(delete_module),
 #ifdef __NR_io_uring_setup
-        CENTURION_DENY(io_uring_setup), CENTURION_DENY(io_uring_enter), CENTURION_DENY(io_uring_register),
+        NVCURVE_DENY(io_uring_setup), NVCURVE_DENY(io_uring_enter), NVCURVE_DENY(io_uring_register),
 #endif
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
-#undef CENTURION_DENY
+#undef NVCURVE_DENY
     struct sock_fprog program{static_cast<unsigned short>(sizeof(code)/sizeof(code[0])), code};
     if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return false;
     return ::syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &program) == 0;

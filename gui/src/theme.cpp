@@ -48,7 +48,7 @@ const Palette PALETTES[] = {
         "#d3c6aa", "#bcc4be", "#bfc4be", "#b4ca93", "#7e8d66", "#9eceaa", "#dcbf84", "#f0b3b4", "#8a4b4c", "#9dcbc5", "#e2b6cb"}},
     {"synthwave", "Synthwave '84", {"#1b1628", "#241b2f", "#262335", "#2f2a42", "#3b3452", "#17121f", "#463d5e", "#2c2640",
         "#ffffff", "#d6cfe4", "#999fc8", "#ff7edb", "#a4518d", "#72f1b8", "#fede5d", "#fe767f", "#8f2830", "#36f9f6", "#b893ce"}},
-    // Originals: Legion black with its red, and a cold blue-green night.
+    // Originals: near-black with red, and a cold blue-green night.
     {"crimson", "Crimson", {"#111112", "#18181a", "#1f1f22", "#28282c", "#333338", "#0c0c0d", "#2e2e33", "#222226",
         "#eeeeee", "#b8b8bc", "#9b9ba1", "#ec787c", "#a94d50", "#7fc98f", "#f0c05a", "#ff7a59", "#8f4632", "#7aa7d9", "#b39ddb"}},
     {"glacier", "Glacier", {"#0f1519", "#141c21", "#1a242a", "#213038", "#2b3d46", "#0b1013", "#26363e", "#1c282e",
@@ -381,28 +381,6 @@ QList<ContrastCheck> contrastChecks(const QStringList &colors) {
     checks << ContrastCheck{QString::fromLatin1(QT_TRANSLATE_NOOP("theme", "Selection text")), QStringLiteral("ON_ACCENT"), QStringLiteral("ACCENT"), contrastRatio(accentTextColor(QColor(colors.at(11))), QColor(colors.at(11))), 4.5, false};
     for (int fg : {11, 12, 13, 14, 15, 17, 18}) add(QString::fromLatin1(QT_TRANSLATE_NOOP("theme", "Chart mark")), fg, 2, 3.0);
     return checks;
-}
-
-/// A fixed (not palette) profile colour, darkened in 10 % steps on a light palette until its dot reads
-/// at 3:1 against the profile button (BG2), the minimum for a non-text mark. Dark palettes keep it as is.
-static QString legible(const char *hex) {
-    QColor c(QString::fromLatin1(hex));
-    const double bg = luminance(QColor(QString::fromLatin1(BG2)));
-    for (int i = 0; i < 20 && bg > luminance(c) && (bg + 0.05) / (luminance(c) + 0.05) < 3.0; ++i)
-        c = QColor::fromRgbF(float(c.redF() * 0.9), float(c.greenF() * 0.9), float(c.blueF() * 0.9));
-    return c.name();
-}
-
-QString profileAccent(const QString &p) {
-    // Do not retain QString copies of theme tokens across palette revisions.
-    if (p == QLatin1String("low-power") || p == QLatin1String("quiet")) return QString::fromLatin1(INFO);
-    if (p == QLatin1String("cool")) return legible("#7cc6bd");
-    if (p == QLatin1String("balanced")) return QString::fromLatin1(FG);
-    if (p == QLatin1String("balanced-performance")) return QString::fromLatin1(WARN);
-    if (p == QLatin1String("performance")) return QString::fromLatin1(DANGER);
-    if (p == QLatin1String("max-power")) return legible("#e070b0");
-    if (p == QLatin1String("custom")) return QString::fromLatin1(PURPLE);
-    return QString::fromLatin1(MUTED);
 }
 
 QString rgba(const char *hex, double alpha) {

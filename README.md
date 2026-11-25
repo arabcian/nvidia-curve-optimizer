@@ -124,6 +124,30 @@ This app and [Centurion](https://github.com/arabcian/centurion) can be installed
 - Colour themes: 21 palettes, chosen in the header; the choice is stored in
   `~/.config/nvcurve-gui/gui.ini` and applied after a restart of the app.
 
+## Supported GPUs
+
+Any NVIDIA GeForce / RTX GPU the proprietary Linux driver supports, desktop or laptop, from any
+board or laptop maker. There is no vendor, model or PCI subsystem check anywhere in the code;
+the limits, P-states and offset ranges are read live from the driver for the GPU in the machine.
+
+| Architecture | Examples | Status |
+|---|---|---|
+| Blackwell | RTX 50 series | Tested (GB202); hotspot / GDDR7 partition sensors via the root sensor helper |
+| Ada Lovelace | RTX 40 series | Expected to work (same NvAPI structures) |
+| Ampere | RTX 30 series | Expected to work |
+| Turing | RTX 20 / GTX 16 series | Expected to work |
+| Pascal | GTX 10 series | Expected to work while the driver still supports it (R580 is the last branch for Pascal) |
+
+"Expected to work" means the V/F-curve structures (`GetVFPCurve` / `ClockBoostTable` v1) are the same
+ones used since Pascal, but the tool has not been run on that generation. Every write is read back and
+rolled back on a mismatch, so an incompatible driver fails the apply instead of writing a wrong curve.
+
+Limits:
+- **One NVIDIA GPU per machine for writes.** Hybrid laptops (Intel/AMD iGPU + NVIDIA dGPU) are fine;
+  systems with two or more NVIDIA GPUs can read but refuse curve/profile writes, because NvAPI and
+  NVML enumeration cannot yet be joined unambiguously.
+- The GUI's simulation sandbox (seccomp) is x86-64 only.
+
 ## Requirements
 
 - NVIDIA proprietary driver (NVML, `libnvidia-ml.so.1`; NvAPI, `libnvidia-api.so`)

@@ -11,9 +11,8 @@
 //!     what matters for a memory overclock.
 //!
 //! The memory type is inferred from the architecture (Blackwell GeForce =
-//!
-//! GDDR7); every value is range-checked, so a wrong guess shows "—", never a
-//!
+//! GDDR7, falling back to the GDDR6 channel for GDDR6 Blackwell boards);
+//! every value is range-checked, so a wrong guess shows "—", never a
 //! bogus number.
 
 use crate::nvapi::{fid, nvcall, Buf, Gpu};
@@ -177,6 +176,8 @@ pub fn read(gpu: Gpu, arch: Option<u32>) -> Sensors {
         s.vram_c = s.vram_partitions.iter().map(|p| p.1).max();
         if s.vram_c.is_some() { src.push("vram: partitions"); }
         else if let Some(c) = chan(VRAM_CHANNEL_GDDR7) { s.vram_c = Some(c); src.push("vram: channel 10"); }
+        // GDDR6 Blackwell boards (e.g. RTX 5050) report memory on the GDDR6 channel.
+        else if let Some(c) = chan(VRAM_CHANNEL_GDDR6) { s.vram_c = Some(c); src.push("vram: channel 15"); }
     } else {
         s.hotspot_c = chan(HOTSPOT_CHANNEL);
         if s.hotspot_c.is_some() { src.push("hotspot: channel 9"); }

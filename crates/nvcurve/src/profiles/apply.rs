@@ -209,6 +209,7 @@ fn revert_profile(g: Gpu, idx: u32, previous: &vfcurve::PointDeltas,
 /// apply must still hold the GPU write lock; a preview is only a snapshot.
 struct PreparedProfile {
     gpu: Gpu,
+    nvml_index: u32,
     gpu_name: String,
     raw: crate::nvapi::Buf,
     state: CurveState,
@@ -222,10 +223,9 @@ struct PreparedProfile {
 fn preflight_profile(gpu_index: usize, p: &ProfileData, cfg: &Config,
                      expected: Option<(&str, &serde_json::Value, &serde_json::Value)>, invalid_points: &mut Vec<usize>) -> Result<PreparedProfile, String> {
     gpu::init_nvapi().map_err(|e| e.to_string())?;
-    gpu::require_single_profile_target(gpu_index)?;
-    checked_limits(gpu_index as u32, p)?;
+    let idx = gpu::require_profile_target(gpu_index)?;
+    checked_limits(idx, p)?;
     let (g, gname) = gpu::get_gpu(gpu_index).map_err(|e| e.to_string())?;
-    let idx = gpu_index as u32;
     let mut out = ApplyOutcome::default();
     if !p.gpu_name.is_empty() && p.gpu_name != gname {
         return Err(format!("profile GPU {:?} differs from actual GPU {:?}", p.gpu_name, gname));
@@ -292,7 +292,7 @@ fn preflight_profile(gpu_index: usize, p: &ProfileData, cfg: &Config,
     if let Some((_, _, device)) = expected {
         if &gpu::curve_device_identity(gpu_index,g,&gname)? != device { return Err("GPU identity changed during preflight".into()); }
     }
-    Ok(PreparedProfile { gpu: g, gpu_name: gname, raw, state, previous_offsets, deltas,
+    Ok(PreparedProfile { gpu: g, nvml_index: idx, gpu_name: gname, raw, state, previous_offsets, deltas,
         old_mem, old_power, warnings: out.warnings })
 }
 
@@ -326,9 +326,8 @@ pub fn apply_profile_checked(gpu_index: usize, name: &str, cfg: &Config,
     expected: Option<(&str, &serde_json::Value, &serde_json::Value)>) -> Result<ApplyOutcome, String> {
     let path = profile_path(&cfg.profile_dir, name).ok_or("invalid profile name")?;
     let p = load_profile(&path)?;
-    let PreparedProfile { gpu: g, gpu_name: gname, raw, state, previous_offsets, deltas,
+    let PreparedProfile { gpu: g, nvml_index: idx, gpu_name: gname, raw, state, previous_offsets, deltas,
         old_mem, old_power, warnings, .. } = preflight_profile(gpu_index, &p, cfg, expected, &mut Vec::new())?;
-    let idx = gpu_index as u32;
     let mut out = ApplyOutcome { warnings, ..ApplyOutcome::default() };
     let changes = changed_points(&deltas, &previous_offsets);
     let previous = old_deltas(&changes, &previous_offsets);
@@ -339,7 +338,9 @@ pub fn apply_profile_checked(gpu_index: usize, name: &str, cfg: &Config,
         if &gpu::curve_device_identity(gpu_index,g,&gname)? != device { return Err("GPU identity changed before write".into()); }
         if vfcurve::read_clock_offsets(g)? != previous_offsets { return Err("CT changed before write".into()); }
     }
-    gpu::require_single_profile_target(gpu_index)?;
+    if gpu::require_profile_target(gpu_index)? != idx {
+        return Err("NVML device mapping changed before profile write".into());
+    }
     if gpu::get_gpu(gpu_index).map_err(|e| e.to_string())?.0 != g {
         return Err("GPU handle changed before profile write".into());
     }
@@ -466,16 +467,14 @@ pub fn run_autoload(cfg: &Config) -> i32 {
         Ok(g) => g,
         Err(e) => { error!("Failed to initialize NvAPI: {e}"); return 1; }
     };
-    if gpus.len() != 1 || gpu::require_single_profile_target(0).is_err() {
-        error!("Autoload skipped: mixed NVAPI/NVML profile target is unavailable or multi-GPU; no profile applied");
-        return 1;
-    }
     let key_to_idx: BTreeMap<String, usize> = gpus.iter().map(|g| (g.stable_key(), g.index)).collect();
     let mut plan: BTreeMap<usize, (&str, &str)> = BTreeMap::new();
     for (key, prof) in &cfg.auto_load_profiles {
         if prof.is_empty() { continue; }
+        // An index-keyed default predates the GPU's UUID key. NVAPI order is not stable
+        // across a second card, so only trust it while exactly one GPU is present.
         let by_index = key.strip_prefix("idx:").and_then(|n| n.parse::<usize>().ok())
-            .filter(|n| gpus.iter().any(|g| g.index == *n));
+            .filter(|n| gpus.len() == 1 && gpus.iter().any(|g| g.index == *n));
         match (key_to_idx.get(key), by_index) {
             (Some(&idx), _) => { plan.insert(idx, (key, prof)); }
             (None, Some(idx)) => { plan.entry(idx).or_insert((key, prof)); }

@@ -76,13 +76,14 @@ pub fn read_curve_retry(gpu_index: usize, retries: u32) -> Result<Value, String>
                 // (NVML, effective MHz) — the ClockBoostTable's memory-domain points
                 // use another unit and are clamped by the driver.
                 // Never associate NVML offsets with an unverified NVAPI index.
-                if device_before.is_some() {
-                    let offs = limits::get_clock_offsets(gpu_index as u32);
+                let nvml_idx = device_before.as_ref().and_then(|_| gpu::nvml_index(gpu_index).ok());
+                if let Some(ni) = nvml_idx {
+                    let offs = limits::get_clock_offsets(ni);
                     v["mem_offset_mhz"] = json!(offs.mem_offset_mhz);
                     v["gpc_offset_mhz"] = json!(offs.gpc_offset_mhz);
                 }
                 let device_after = gpu::curve_device_identity(gpu_index,g,&name).ok();
-                if device_before.is_none() || device_before != device_after {
+                if nvml_idx.is_none() || device_before != device_after {
                     v["mem_offset_mhz"] = Value::Null;
                     v["gpc_offset_mhz"] = Value::Null;
                     v["device_identity"] = Value::Null;
@@ -117,11 +118,12 @@ pub fn sensors_json(gpu_index: usize) -> Value {
     let unknown = || json!({"architecture":null,"hotspot_c":null,"vram_c":null,"vram_partitions":[],"channels":[],"sensor_source":"unavailable","throttle":null,"power_mizer":null,"offset_ranges":{"gpc_mhz":null,"mem_mhz":null},"identity_error":"ambiguous or changed GPU identity"});
     let Ok((g, name)) = gpu::get_gpu(gpu_index) else { return unknown(); };
     let Ok(identity) = gpu::curve_device_identity(gpu_index, g, &name) else { return unknown(); };
-    let arch = nvml::ready().ok().and_then(|n| n.architecture(n.handle(gpu_index as u32).ok()?).ok());
+    let Ok(ni) = gpu::nvml_index(gpu_index) else { return unknown(); };
+    let arch = nvml::ready().ok().and_then(|n| n.architecture(n.handle(ni).ok()?).ok());
     let s = sensors::read(g, arch);
-    let t = limits::get_throttle(gpu_index as u32);
-    let pm = limits::get_power_mizer(gpu_index as u32).ok();
-    let r = limits::get_offset_ranges(gpu_index as u32);
+    let t = limits::get_throttle(ni);
+    let pm = limits::get_power_mizer(ni).ok();
+    let r = limits::get_offset_ranges(ni);
     if gpu::curve_device_identity(gpu_index, g, &name).ok().as_ref() != Some(&identity) { return unknown(); }
     json!({
         "device_identity": identity,
@@ -182,7 +184,8 @@ pub fn reset_vf_offsets_verified(gpu_index: usize, domain: Option<crate::types::
 /// deliberately left untouched (Reset All handles those separately).
 pub fn reset_gpu_curve_verified(gpu_index: usize) -> Result<String, String> {
     let summary = reset_vf_offsets_verified(gpu_index, None)?;
-    match gpu::nvml_index(gpu_index).and_then(limits::reset_gpu_locked_clocks) {
+    let ni = gpu::nvml_index(gpu_index).map_err(|e| format!("{summary}; core cap not released: {e}"))?;
+    match limits::reset_gpu_locked_clocks(ni) {
         Ok(()) => Ok(format!("{summary}; GPU cap released")),
         Err(e) if e.contains("Not Supported") || e.contains("not found") =>
             Ok(format!("{summary}; core lock API unavailable")),
@@ -202,7 +205,7 @@ pub fn reset_everything(gpu_index: usize) -> (Vec<String>, Vec<String>) {
     }
     let idx = match gpu::nvml_index(gpu_index) {
         Ok(i) => i,
-        Err(e) => { errs.push(format!("NVML settings not reset: {e}")); return (done, errs); }
+        Err(e) => { errs.push(format!("NVML target: {e}")); return (done, errs); }
     };
     match limits::reset_all_clock_offsets(idx) {
         Ok(v) if v.is_empty() => done.push("NVML clock offsets already 0 in every P-state".into()),
@@ -284,6 +287,9 @@ pub fn set_default_profile(index: usize, name: Option<&str>) -> Result<(), Strin
     let mut m = persistent_load(PERSISTENT_CONFIG_FILE);
     migrate_legacy(&mut m);
     let key = gpu_stable_key_offline(index).ok_or_else(|| format!("GPU {index} not found"))?;
+    if key.starts_with("idx:") && name.is_some() && gpu::discover_gpus().is_ok_and(|g| g.len() > 1) {
+        return Err(format!("GPU {index} has no verified UUID; a multi-GPU default needs one"));
+    }
     let entry = m.entry("auto_load_profiles").or_insert_with(|| json!({}));
     if !entry.is_object() { *entry = json!({}); }
     let profiles = entry.as_object_mut().unwrap();

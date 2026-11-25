@@ -33,10 +33,6 @@ inline constexpr int FONT_PT = 9, RADIUS = 10;
 inline constexpr int BRAND_X = 16, BRAND_ICON = 22, BRAND_GAP = 9;
 int brandInset();
 
-/// Per-profile colour, after the Legion power-button LED: Quiet/Power Saver
-/// blue, Balanced white, Performance red, Custom purple (Extreme: magenta).
-QString profileAccent(const QString &profile);
-
 /// Premade palettes: (id, display name), in menu order.
 QList<QPair<QString, QString>> themes();
 QString currentTheme();

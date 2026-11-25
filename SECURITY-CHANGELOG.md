@@ -8,6 +8,24 @@ doğrulanmıştır.
 
 ---
 
+## Çoklu GPU (çift NVIDIA) desteği
+
+- **Eşleme LACT'teki gibi PCI bus üzerinden.** Her NvAPI fiziksel GPU'su, aynı PCI bus
+  numarasındaki NVML cihazıyla eşlenir (`gpu::nvml_index`). Eşleme ancak tam ve benzersiz
+  bir birebir eşleme ise, model adları aynıysa ve UUID/PCI adresleri benzersizse kabul
+  edilir; aynı bus numarası iki kez görünürse veya sayılar farklıysa yazma reddedilir.
+- **NVAPI indeksi NVML indeksi olarak kullanılmaz.** Bellek offset'i, saat kilitleri, güç
+  limiti, PowerMizer ve geri alma (rollback) yolları eşlenmiş NVML indeksini kullanır;
+  uygulama, yazmadan hemen önce eşlemeyi yeniden doğrular (`require_profile_target`).
+- **Root helper `gpu_index` alır** (tamsayı 0..63, yoksa 0); başka değer reddedilir.
+- **Varsayılan profil GPU başına UUID ile tutulur.** Birden fazla GPU varken `idx:N`
+  anahtarlı (UUID'siz) varsayılanlar ne yazılır ne de autoload'da uygulanır: NVAPI sırası
+  ikinci bir kart takılınca değişebilir.
+- **Snapshot geri yükleme** birden fazla GPU'da yalnızca UUID'li snapshot'larla yapılır.
+- `nvcurve-sensors` hâlâ argüman/girdi almaz; her GPU'yu `gpus` dizisinde yayınlar.
+
+---
+
 ## 1.0.0 — Centurion'dan ayrıştırma
 
 ### Kaldırılan saldırı yüzeyi

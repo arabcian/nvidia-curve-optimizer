@@ -27,7 +27,7 @@ commands:
   write     (--point N | --range A-B | --global) --delta MHz [--dry-run] [--max-delta MHz]
   write     --reset | --reset-all [--dry-run]
   snapshot  save | restore [--file F] | list
-  gpus                                           List NVIDIA GPUs
+  gpus      [--json]                             List NVIDIA GPUs (--gpu N takes the [N] index)
   profile   list | save NAME | apply NAME | default (NAME | --clear)
   memlock   status | set (--max MHz | --to-max) [--min MHz] | reset
   sensors   [--json] [--raw]                     Hotspot + VRAM temps, throttle reasons, PowerMizer
@@ -354,8 +354,9 @@ fn cmd_snapshot(a: &Args, cfg: &Config) {
     }
 }
 
-fn cmd_gpus() {
+fn cmd_gpus(a: &Args) {
     let gpus = gpu::discover_gpus().unwrap_or_else(|e| die(1, format!("nvcurve: {e}")));
+    if a.flag("--json") { println!("{}", json!({"ok": true, "gpus": gpus})); return; }
     if gpus.is_empty() { println!("No NVIDIA GPUs detected."); return; }
     for g in gpus {
         let pci = g.pci_address.as_deref().unwrap_or("PCI N/A");
@@ -393,7 +394,7 @@ fn cmd_profile(a: &Args, cfg: &Config) {
             let n = need("save");
             require_root();
             let (g, gname) = open_gpu(a);
-            let idx = gpu::nvml_index(a.gpu()).unwrap_or_else(|e| die(1, format!("nvcurve: {e}")));
+            let idx = nvml_gpu(a);
             let s = vfcurve::read_curve(g, &gname).unwrap_or_else(|e| die(1, format!("Failed to read curve: {e}")));
             // GPU-core points only: the memory offset is saved as mem_offset_mhz (NVML); memory-domain
             // ClockBoostTable deltas would be applied on top of it.
@@ -430,8 +431,14 @@ fn cmd_profile(a: &Args, cfg: &Config) {
 
 // ── memlock ─────────────────────────────────────────────────────────────────
 
+/// NVML index of `--gpu N` (an NVAPI index), matched by PCI bus.
+fn nvml_gpu(a: &Args) -> u32 {
+    gpu::init_nvapi().unwrap_or_else(|e| die(1, format!("nvcurve: {e}")));
+    gpu::nvml_index(a.gpu()).unwrap_or_else(|e| die(1, format!("nvcurve: {e}")))
+}
+
 fn cmd_memlock(a: &Args) {
-    let idx = gpu::nvml_index(a.gpu()).unwrap_or_else(|e| die(1, format!("nvcurve: {e}")));
+    let idx = nvml_gpu(a);
     match a.pos.get(1).map(String::as_str) {
         Some("status") => {
             let c = limits::get_supported_mem_clocks(idx);
@@ -507,7 +514,7 @@ fn cmd_sensors(a: &Args) {
 }
 
 fn cmd_powermizer(a: &Args) {
-    let idx = gpu::nvml_index(a.gpu()).unwrap_or_else(|e| die(1, format!("nvcurve: {e}")));
+    let idx = nvml_gpu(a);
     match a.pos.get(1).map(String::as_str) {
         Some("status") | None => match limits::get_power_mizer(idx) {
             Ok(p) => {
@@ -635,7 +642,7 @@ fn main() {
         Some("validate-draft") => cmd_validate_draft(&a, &cfg),
         Some("write") => cmd_write(&a, &cfg),
         Some("snapshot") => cmd_snapshot(&a, &cfg),
-        Some("gpus") => cmd_gpus(),
+        Some("gpus") => cmd_gpus(&a),
         Some("profile") => cmd_profile(&a, &cfg),
         Some("memlock") => cmd_memlock(&a),
         Some("sensors") => cmd_sensors(&a),

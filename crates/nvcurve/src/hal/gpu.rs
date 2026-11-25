@@ -53,21 +53,63 @@ pub fn get_gpu(index: usize) -> Result<(Gpu, String), NvError> {
     Ok((gpu, gpu_name(gpu)))
 }
 
-/// Identity for the GUI's index-zero curve editor. NVAPI and NVML enumeration
-/// order is NOT a join key. Until a full cross-API PCI mapping is available,
-/// require one visible physical GPU in both APIs, equal model names and a
-/// fresh NVML handle. Ambiguous multi-GPU layouts fail closed for edited Apply.
+/// Identity of the GPU at NVAPI `index`, bound to its NVML device.
+///
+/// NVAPI and NVML enumeration order is NOT a join key. One visible GPU in
+/// both APIs is matched directly; with several GPUs each NVAPI handle is
+/// matched to the NVML device on the same PCI bus (LACT's
+/// `find_matching_gpu(bus_id)`), and only a complete, unique bijection with
+/// equal model names is accepted. Anything ambiguous fails closed.
 pub fn curve_device_identity(index: usize, gpu: Gpu, name: &str) -> Result<serde_json::Value, String> {
     let handles = enumerate_gpus().map_err(|e| e.to_string())?;
+    if handles.get(index) != Some(&gpu) {
+        return Err("Cannot establish unambiguous NVAPI/NVML GPU identity".into());
+    }
+    if handles.len() == 1 { return single_gpu_identity(gpu, name); }
+    let rows = inventory_mapping(&handles)?;
+    let row = &rows[index];
     let n = nvml::ready()?;
-    if index != 0 || handles.as_slice() != [gpu] || n.device_count()? != 1 {
+    let h = n.fresh_handle(row.nvml_index)?;
+    if !same_model(name, &n.device_name(h)?) { return Err("NVAPI and NVML GPU names differ".into()); }
+    if n.uuid(h)? != row.uuid || n.pci_identity(h)? != row.pci { return Err("GPU inventory changed".into()); }
+    let driver = n.driver_version()?;
+    let vbios = n.vbios_version(h)?;
+    if driver.is_empty() || vbios.is_empty() { return Err("Missing driver or VBIOS identity".into()); }
+    if enumerate_gpus().map_err(|e| e.to_string())? != handles || n.fresh_handle(row.nvml_index)? != h {
+        return Err("GPU topology changed during identity capture".into());
+    }
+    Ok(serde_json::json!({"schema":1,"mapping":"unique_pci_bus","uuid":row.uuid,"pci":row.pci,"driver":driver,"vbios":vbios}))
+}
+
+/// NVML device index of the GPU at NVAPI `index`. Every NVML getter/setter
+/// for a curve target must use this, never the NVAPI index itself.
+pub fn nvml_index(index: usize) -> Result<u32, String> {
+    let handles = enumerate_gpus().map_err(|e| e.to_string())?;
+    if index >= handles.len() {
+        return Err(format!("GPU index {index} out of range (found {} GPU(s))", handles.len()));
+    }
+    if handles.len() == 1 {
+        single_gpu_identity(handles[0], &gpu_name(handles[0]))?;
+        return Ok(0);
+    }
+    Ok(inventory_mapping(&handles)?[index].nvml_index)
+}
+
+fn same_model(a: &str, b: &str) -> bool {
+    fn normalized(s: &str) -> &str { s.trim().strip_prefix("NVIDIA ").unwrap_or(s.trim()) }
+    !a.is_empty() && normalized(a) == normalized(b)
+}
+
+/// One visible physical GPU in both APIs, equal model names, a fresh NVML handle.
+fn single_gpu_identity(gpu: Gpu, name: &str) -> Result<serde_json::Value, String> {
+    let n = nvml::ready()?;
+    if enumerate_gpus().map_err(|e| e.to_string())?.as_slice() != [gpu] || n.device_count()? != 1 {
         return Err("Cannot establish unambiguous NVAPI/NVML GPU identity".into());
     }
     let h = n.fresh_handle(0)?;
     if n.handle(0)? != h { return Err("GPU handle changed; restart the helper".into()); }
     let nvml_name = n.device_name(h)?;
-    fn normalized(s: &str) -> &str { s.trim().strip_prefix("NVIDIA ").unwrap_or(s.trim()) }
-    if name.is_empty() || normalized(name) != normalized(&nvml_name) {
+    if !same_model(name, &nvml_name) {
         return Err("NVAPI and NVML GPU names differ".into());
     }
     let uuid = n.uuid(h)?;
@@ -87,8 +129,10 @@ fn valid_gpu_uuid(s: &str) -> bool {
 }
 
 // Bus-only evidence is sufficient ONLY when it forms a complete, unique
-// bijection across both APIs. Duplicate bus numbers across PCI domains/slots
-// must remain ambiguous. This is inventory evidence, not write authorization.
+// bijection across both APIs (LACT matches NVML → NVAPI by bus number the
+// same way). Duplicate bus numbers across PCI domains/slots must remain
+// ambiguous. Writes additionally require equal model names and unique,
+// re-read UUID/PCI identities (curve_device_identity).
 fn bus_mapping(api: &[u32], ml: &[u32]) -> Option<Vec<usize>> {
     if api.is_empty() || api.len() != ml.len() || api.len() > MAX_PHYSICAL_GPUS { return None; }
     let mut used = std::collections::HashSet::new();
@@ -110,7 +154,7 @@ fn api_bus(gpu: Gpu) -> Result<u32, String> {
 }
 #[derive(PartialEq, Eq)]
 struct InventoryRow { handle: nvml::Handle, bus: u32, uuid: String, pci: String, name: String }
-struct InventoryIdentity { uuid: String, bus: u32, pci: String }
+struct InventoryIdentity { uuid: String, bus: u32, pci: String, nvml_index: u32 }
 /// Fresh read-only join; no index-order assumption, no ambiguous partial join.
 fn inventory_mapping(handles: &[Gpu]) -> Result<Vec<InventoryIdentity>, String> {
     let n = nvml::ready()?;
@@ -118,7 +162,7 @@ fn inventory_mapping(handles: &[Gpu]) -> Result<Vec<InventoryIdentity>, String> 
     if count != handles.len() || count == 0 || count > MAX_PHYSICAL_GPUS { return Err("GPU enumeration count differs".into()); }
     if count == 1 {
         let name = gpu_name(handles[0]);
-        let d = curve_device_identity(0, handles[0], &name)?;
+        let d = single_gpu_identity(handles[0], &name)?;
         let h = n.fresh_handle(0)?;
         let bus = n.pci_bus(h)?;
         if n.uuid(h)? != d["uuid"].as_str().unwrap_or("") || n.pci_identity(h)? != d["pci"].as_str().unwrap_or("") {
@@ -127,7 +171,7 @@ fn inventory_mapping(handles: &[Gpu]) -> Result<Vec<InventoryIdentity>, String> 
         if n.device_count()? != 1 || n.fresh_handle(0)? != h || enumerate_gpus().map_err(|e| e.to_string())?.as_slice() != handles {
             return Err("GPU inventory changed".into());
         }
-        return Ok(vec![InventoryIdentity { uuid: d["uuid"].as_str().unwrap_or("").to_owned(), bus, pci: d["pci"].as_str().unwrap_or("").to_owned() }]);
+        return Ok(vec![InventoryIdentity { uuid: d["uuid"].as_str().unwrap_or("").to_owned(), bus, pci: d["pci"].as_str().unwrap_or("").to_owned(), nvml_index: 0 }]);
     }
     let capture = || -> Result<Vec<InventoryRow>, String> {
         (0..count).map(|i| {
@@ -144,15 +188,13 @@ fn inventory_mapping(handles: &[Gpu]) -> Result<Vec<InventoryIdentity>, String> 
     let mut uuids = std::collections::HashSet::new();
     let mut pci_ids = std::collections::HashSet::new();
     let mut out = Vec::new();
-    fn normalized(s: &str) -> &str { s.trim().strip_prefix("NVIDIA ").unwrap_or(s.trim()) }
     for (&g, i) in handles.iter().zip(indices) {
         let row = &ml[i];
-        let api_name = gpu_name(g);
-        if api_name.is_empty() || normalized(&api_name) != normalized(&row.name)
+        if !same_model(&gpu_name(g), &row.name)
             || !uuids.insert(row.uuid.to_ascii_lowercase()) || !pci_ids.insert(row.pci.clone()) {
             return Err("Ambiguous GPU inventory identity".into());
         }
-        out.push(InventoryIdentity { uuid: row.uuid.clone(), bus: row.bus, pci: row.pci.clone() });
+        out.push(InventoryIdentity { uuid: row.uuid.clone(), bus: row.bus, pci: row.pci.clone(), nvml_index: i as u32 });
     }
     if n.device_count()? as usize != count || enumerate_gpus().map_err(|e| e.to_string())?.as_slice() != handles
         || handles.iter().map(|&h| api_bus(h)).collect::<Result<Vec<_>, _>>()? != api || capture()? != ml {
@@ -161,36 +203,16 @@ fn inventory_mapping(handles: &[Gpu]) -> Result<Vec<InventoryIdentity>, String> 
     Ok(out)
 }
 
-/// NVML index of the GPU at NVAPI `index` (the public index). The two APIs may
-/// enumerate in different orders, so NVML-only writes must go through this.
-/// One GPU in both APIs is unambiguous; otherwise the verified inventory join
-/// decides, and an ambiguous layout fails closed.
-pub fn nvml_index(index: usize) -> Result<u32, String> {
-    init_nvapi().map_err(|e| e.to_string())?;
+/// Verified profile target: the GPU at NVAPI `index` with a fresh, unique
+/// NVAPI/NVML identity. Returns the NVML index every NVML setter must use.
+pub fn require_profile_target(index: usize) -> Result<u32, String> {
     let handles = enumerate_gpus().map_err(|e| e.to_string())?;
-    let n = nvml::ready()?;
-    if index >= handles.len() { return Err(format!("GPU index {index} out of range (found {} GPU(s))", handles.len())); }
-    if handles.len() == 1 && n.device_count()? == 1 { return Ok(0); }
-    let uuid = &inventory_mapping(&handles)?[index].uuid;
-    for i in 0..n.device_count()? {
-        if &n.uuid(n.fresh_handle(i)?)? == uuid { return Ok(i); }
-    }
-    Err("GPU disappeared from NVML during index mapping".into())
+    let gpu = *handles.get(index).ok_or_else(|| format!("GPU index {index} out of range (found {} GPU(s))", handles.len()))?;
+    curve_device_identity(index, gpu, &gpu_name(gpu))?;
+    nvml_index(index)
 }
 
-/// Mixed CT/NVML profile writes still use same-index APIs. Until all setters
-/// and rollback paths use an explicit verified handle, refuse multi-GPU apply.
-/// Do not change the standalone emergency reset path here.
-pub fn require_single_profile_target(index: usize) -> Result<(), String> {
-    let handles = enumerate_gpus().map_err(|e| e.to_string())?;
-    if index != 0 || handles.len() != 1 || nvml::ready()?.device_count()? != 1 {
-        return Err("Mixed NVAPI/NVML profile Apply requires one physical NVIDIA GPU; multi-GPU writes are not verified".into());
-    }
-    curve_device_identity(index, handles[0], &gpu_name(handles[0]))?;
-    Ok(())
-}
-
-/// All physical GPUs. UUID/PCI metadata is absent when cross-API inventory
+/// All physical GPUs. UUID/PCI/NVML metadata is absent when cross-API inventory
 /// cannot be joined safely. The public index remains the NVAPI index.
 pub fn discover_gpus() -> Result<Vec<GpuInfo>, NvError> {
     init_nvapi()?;
@@ -204,7 +226,8 @@ pub fn discover_gpus() -> Result<Vec<GpuInfo>, NvError> {
         let identity = mapped.as_ref().and_then(|m| m.get(i));
         GpuInfo { name: gpu_name(g), index: i, uuid: identity.map(|v| v.uuid.clone()), pci_bus_id: identity.map(|v| v.bus),
             pci_address: identity.map(|v| v.pci.clone()),
-            identity_evidence: identity.map(|_| if gpus.len() == 1 { "single_visible_physical_gpu" } else { "unique_bus_inventory_only" }) }
+            identity_evidence: identity.map(|_| if gpus.len() == 1 { "single_visible_physical_gpu" } else { "unique_pci_bus" }),
+            nvml_index: identity.map(|v| v.nvml_index) }
     }).collect())
 }
 

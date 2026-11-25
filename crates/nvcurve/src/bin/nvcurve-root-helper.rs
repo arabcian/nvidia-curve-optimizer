@@ -387,6 +387,12 @@ fn run() -> Value {
         Err(e) => return json!({"ok": false, "error": e}),
     };
     match handler(obj) {
+        // The driver-options ops answer with a JSON object that the dialog reads at top level.
+        Ok(m) if op.starts_with("nvreg_") => {
+            let mut v: Value = serde_json::from_str(&m).unwrap_or_else(|_| json!({}));
+            if let Some(o) = v.as_object_mut() { o.insert("ok".into(), json!(true)); }
+            v
+        }
         Ok(m) => json!({"ok": true, "message": m}),
         Err(e) => json!({"ok": false, "error": e}),
     }

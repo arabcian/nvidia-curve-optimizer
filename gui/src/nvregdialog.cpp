@@ -18,7 +18,7 @@
 #include <QTimer>
 #include <QPointer>
 
-static QString helperPath() { return privileged::helperPath(QStringLiteral("tune-helper")); }
+static QString helperPath() { return privileged::helperPath(QStringLiteral("nvcurve-root-helper")); }
 
 static QLabel *dim(const QString &t, const char *color = theme::MUTED) {
     auto *l = new QLabel(t);

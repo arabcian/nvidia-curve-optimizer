@@ -81,6 +81,21 @@ nvidia-curve-optimizer/
 - **Sensor safety**: Blackwell hotspot / VRAM register reads skip a sample while a GPU write holds
   the lock, and never re-probe absent memory partitions.
 
+## Alongside Centurion
+
+This app and [Centurion](https://github.com/arabcian/centurion) can be installed on the same machine.
+
+- **Separate:** install prefix (`/usr/local` here, `/usr` for Centurion), helper directory
+  (`libexec/nvcurve-gui`), polkit actions (`com.nvcurve.gui.*`), boot services
+  (`nvcurve-gui-autoload`, `nvcurve-gui-boot-guard`) and boot-guard state (`/var/lib/nvcurve`).
+  The installer never overwrites a Centurion unit or an existing `nvcurve` command; this project's CLI
+  is then run as `<libexec>/nvcurve`.
+- **Shared on purpose:** `/etc/nvcurve` (profiles and the ★ Default in `config.json`) and the GPU
+  write lock `/run/nvcurve.lock`, so the two never write the GPU at the same moment. The uninstaller
+  keeps `/etc/nvcurve` while Centurion is installed.
+- **Enable only one boot service.** Both would apply the same ★ Default profile at boot; Centurion's
+  boot guard does not see this project's and the reverse.
+
 ## Architecture
 
 - `nvcurve-gui` draws the V/F curve and the controls. It never writes to the

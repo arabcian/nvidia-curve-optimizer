@@ -22,8 +22,14 @@ public:
     const QVector<QPointF> &points() const { return pts_; }
     const QSet<int> &selection() const { return sel_; }
     int current() const { return cur_; }
+    /// Read-only validator markers; independent of editor selection and undo.
+    void setInvalidPoints(const QSet<int> &indices);
+    /// Samples per point from a recorded session (vfcoverage); empty or a size mismatch clears the overlay.
+    void setObservedCounts(const QVector<int> &counts);
     /// Full view of the curve; also resets zoom and pan.
     void fitAxes();
+    void setReferenceCurves(const QVector<QPointF> &base, const QVector<QPointF> &readback);
+    void setReferenceVisibility(bool base, bool readback);
 
     // ── zoom / pan (voltage axis; frequency auto-fits to what is visible) ──
     static constexpr double MAX_ZOOM = 12.0;
@@ -62,6 +68,7 @@ protected:
     void mouseReleaseEvent(QMouseEvent *) override;
     void keyPressEvent(QKeyEvent *) override;
     void wheelEvent(QWheelEvent *) override;
+    void contextMenuEvent(QContextMenuEvent *) override;
 
 private:
     QRectF plotRect() const;
@@ -70,8 +77,10 @@ private:
     int hitTest(QPointF px) const;
     void applyView();
 
-    QVector<QPointF> pts_;
-    QSet<int> sel_;
+    QVector<QPointF> pts_, baseRef_, readRef_;
+    bool showBase_ = true, showRead_ = true;
+    QSet<int> sel_, invalidPoints_;
+    QVector<int> observed_;
     int cur_ = 0;
     double xMin_ = 600, xMax_ = 1200, yMin_ = 0, yMax_ = 3000;
     double fullX0_ = 600, fullX1_ = 1200, fullY1_ = 3000;

@@ -53,11 +53,11 @@ proprietary driver.
 ```
 nvidia-curve-optimizer/
 ├── gui/                       # Qt6 GUI (C++20): curve tab, graph widget, trial bar, theme system
-│   ├── src/                   #   main.cpp  nvidiatab.*  vfcurvewidget.*  trialbar.*  theme.*  privileged.*  icon.*
+│   ├── src/                   #   main.cpp  nvidiatab.*  vfcurvewidget.*  trialbar.*  nvregdialog.*  theme.*  privileged.*  icon.*
 │   └── data/                  #   theme glyphs, app icon (SVG)
 ├── crates/nvcurve/            # Rust core: NvAPI/NVML (dlopen) HAL, safety limits, profiles, root helpers
 │   └── src/bin/               #   nvcurve (CLI)  nvcurve-root-helper  nvcurve-sensors  nvcurve-boot-guard
-├── packaging/                 # systemd units + OpenRC scripts (nvcurve-autoload, nvcurve-boot-guard)
+├── packaging/                 # systemd units + OpenRC scripts (nvcurve-gui-autoload, nvcurve-gui-boot-guard)
 ├── com.nvcurve.gui.policy     # polkit actions (pinned to the helpers)
 ├── 49-nvcurve-gui.rules       # polkit rules: allowlist + security level 1/2
 ├── nvcurve-gui.desktop        # application launcher
@@ -65,6 +65,38 @@ nvidia-curve-optimizer/
 ├── USAGE.md  SECURITY-CHANGELOG.md  LICENSE  NOTICE
 └── Cargo.toml  Cargo.lock
 ```
+
+## Features synced from Centurion (experimental)
+
+- **Verified GPU identity**: every apply is bound to the GPU (UUID, PCI address, driver, VBIOS) the
+  curve was read from; a changed or ambiguous (multi-GPU) topology refuses the write.
+- **Verified writes**: apply / reset write a prepared table, read it back exactly and roll back on
+  a mismatch; no blind retries after an Xid. Snapshots restore only checked per-point deltas.
+- **Flatten guard** and **Xid 154 hardening**: see `docs/NVCURVE-FLATTEN-SAFETY.md` and
+  `docs/NVCURVE-XID154-HARDENING.md`.
+- **Curve editor**: undo / redo, reference curves (base / read-back), invalid-point markers, a draft
+  validator and a transaction history of recent applies. *Record used region* samples the graphics clock and
+  marks the estimated points exercised against the last hardware read-back.
+- **Driver options**: the NVIDIA tab's *Driver options…* dialog edits a validated set of `nvidia` /
+  `nvidia_drm` module options in `/etc/modprobe.d/zz-nvcurve-nvidia.conf` (applies at next boot).
+- **GPU Test**: run Vulkan core and VRAM checks, choose the NVIDIA GPU, and review saved results.
+- **Sensor safety**: Blackwell hotspot / VRAM register reads skip a sample while a GPU write holds
+  the lock, and never re-probe absent memory partitions.
+
+## Alongside Centurion
+
+This app and [Centurion](https://github.com/arabcian/centurion) can be installed on the same machine.
+
+- **Separate:** install prefix (`/usr/local` here, `/usr` for Centurion), helper directory
+  (`libexec/nvcurve-gui`), polkit actions (`com.nvcurve.gui.*`), boot services
+  (`nvcurve-gui-autoload`, `nvcurve-gui-boot-guard`) and boot-guard state (`/var/lib/nvcurve`).
+  The installer never overwrites a Centurion unit or an existing `nvcurve` command; this project's CLI
+  is then run as `<libexec>/nvcurve`.
+- **Shared on purpose:** `/etc/nvcurve` (profiles and the ★ Default in `config.json`) and the GPU
+  write lock `/run/nvcurve.lock`, so the two never write the GPU at the same moment. The uninstaller
+  keeps `/etc/nvcurve` while Centurion is installed.
+- **Enable only one boot service.** Both would apply the same ★ Default profile at boot; Centurion's
+  boot guard does not see this project's and the reverse.
 
 ## Architecture
 
@@ -84,7 +116,7 @@ nvidia-curve-optimizer/
   `allow_active=yes`).
 - `nvcurve` (CLI) is the same core without the GUI: `nvcurve read`, `profile
   apply NAME`, `autoload`, … Run `nvcurve` without arguments for the list.
-- Boot-time profile (optional): `nvcurve-autoload` applies the profile marked
+- Boot-time profile (optional): `nvcurve-gui-autoload` applies the profile marked
   ★ Default. `nvcurve-boot-guard` arms at boot and disarms after 3 minutes of
   stable uptime; a boot that dies in between pauses the autoload until
   `nvcurve-boot-guard reset`, so a too-aggressive curve cannot crash-loop the
@@ -96,7 +128,8 @@ nvidia-curve-optimizer/
 
 - NVIDIA proprietary driver (NVML, `libnvidia-ml.so.1`; NvAPI, `libnvidia-api.so`)
 - polkit (`pkexec`)
-- Build: Rust (cargo), CMake ≥ 3.19, a C++20 compiler, Qt6 ≥ 6.4 (Widgets, Svg)
+- NVIDIA Vulkan driver support for the optional GPU core and VRAM tests.
+- Build: Rust (cargo with edition 2024 support), CMake ≥ 3.19, a C++20 compiler, Qt6 ≥ 6.4 (Widgets, Svg)
 
 ```bash
 # Debian/Ubuntu

@@ -18,6 +18,11 @@ add_executable(nvcurve-gui
     src/vfcurvewidget.cpp src/vfcurvewidget.h
     src/nvidiatab.cpp    src/nvidiatab.h
     src/trialbar.cpp     src/trialbar.h
+    src/nvregdialog.cpp  src/nvregdialog.h
+    src/userhelper.cpp   src/userhelper.h
+    src/charts.cpp       src/charts.h
+    src/gpustress.cpp    src/gpustress.h
+    src/gpustressbox.cpp src/gpustressbox.h
 )
 # Theme glyphs (checkbox tick, spin/combo chevrons), @2x for HiDPI. Compiled
 # with qt_add_resources, not AUTORCC: CMake's Makefile generator runs the
@@ -94,3 +99,11 @@ target_link_libraries(nvcurve-gui PRIVATE Qt6::Widgets Qt6::Svg ${CMAKE_DL_LIBS}
 include(GNUInstallDirs)
 install(TARGETS nvcurve-gui RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES data/nvcurve-gui.svg DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)
+
+option(NVCURVE_BUILD_TESTS "Build the unit tests" OFF)
+if(NVCURVE_BUILD_TESTS)
+    enable_testing()
+    add_executable(nvcurve-gpustress-test tests/gpustress_test.cpp src/gpustress.cpp)
+    target_link_libraries(nvcurve-gpustress-test PRIVATE Qt6::Core)
+    add_test(NAME gpustress COMMAND nvcurve-gpustress-test)
+endif()

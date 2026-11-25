@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/nvcurve"]
+members = ["crates/nvcurve", "crates/nvcurve-gpustress"]
 
 [workspace.package]
 edition = "2021"

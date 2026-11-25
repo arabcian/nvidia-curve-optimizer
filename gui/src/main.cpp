@@ -8,11 +8,13 @@
 // Single instance: a per-user QLockFile (PID-checked, so a crash never leaves it stuck). Two windows
 // would each show a curve the other one has already changed.
 #include "icon.h"
+#include "gpustressbox.h"
 #include "nvidiatab.h"
 #include "theme.h"
 #include <QAbstractSpinBox>
 #include <QApplication>
 #include <QComboBox>
+#include <QTabWidget>
 #include <QDir>
 #include <QFile>
 #include <QFocusEvent>
@@ -181,7 +183,20 @@ public:
         bar->addWidget(new QLabel(QStringLiteral("Theme")));
         bar->addWidget(themeBox);
         col->addLayout(bar);
-        col->addWidget(new NvidiaTab, 1);
+        auto *tabs = new QTabWidget;
+        auto *curve = new NvidiaTab;
+        auto *test = new GpuStressBox([curve] { return !curve->operationActive(); },
+                                      [curve](const QString &pci) { return curve->testCurve(pci); });
+        const int curveIndex = tabs->addTab(curve, tr("NVIDIA Curve"));
+        const int testIndex = tabs->addTab(test, tr("GPU Test"));
+        connect(tabs, &QTabWidget::currentChanged, this, [test, testIndex](int index) {
+            if (index == testIndex) test->refresh(!qEnvironmentVariableIsEmpty("NVCURVE_GUI_FAKE") || !NvidiaTab::present());
+        });
+        connect(test, &GpuStressBox::runningChanged, this, [tabs, curveIndex, themeBox](bool running) {
+            tabs->setTabEnabled(curveIndex, !running);
+            themeBox->setEnabled(!running);
+        });
+        col->addWidget(tabs, 1);
         setCentralWidget(central);
     }
 };
@@ -199,7 +214,7 @@ int main(int argc, char **argv) {
     const QStringList args = app.arguments();
     if (args.contains("--version") || args.contains("-V")) { std::printf("nvcurve-gui %s\n", NVCURVE_GUI_VERSION); return 0; }
 
-    if (!NvidiaTab::present()) {
+    if (qEnvironmentVariableIsEmpty("NVCURVE_GUI_FAKE") && !NvidiaTab::present()) {
         std::fputs("nvcurve-gui: no NVIDIA GPU found.\n", stderr);
         theme::apply(app);
         QMessageBox::critical(nullptr, QStringLiteral("NVIDIA Curve Optimizer"), QStringLiteral("No NVIDIA GPU found."));

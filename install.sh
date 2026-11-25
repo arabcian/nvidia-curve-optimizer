@@ -121,7 +121,7 @@ if (( BUILD )); then
 fi
 
 T=target/release
-for f in nvcurve nvcurve-root-helper nvcurve-sensors nvcurve-boot-guard; do
+for f in nvcurve nvcurve-root-helper nvcurve-sensors nvcurve-boot-guard nvcurve-gpustress; do
     [[ -x $T/$f ]] || { err "$T/$f not found — run without --no-build"; exit 1; }
 done
 [[ -x gui/build/nvcurve-gui ]] || { err "gui/build/nvcurve-gui not found — run without --no-build"; exit 1; }
@@ -161,10 +161,22 @@ install -d "${own[@]}" -m 0755 "$DESTDIR$LIBEXEC" "$DESTDIR$PREFIX/bin"
 # action pins pkexec's exec.path to this exact file, so its content can never be swapped by a
 # non-root user.
 install "${own[@]}" -m 0700 "$T/nvcurve-root-helper" "$DESTDIR$LIBEXEC/"
-install "${own[@]}" -m 0755 "$T/nvcurve-sensors" "$T/nvcurve-boot-guard" "$DESTDIR$LIBEXEC/"
-install "${own[@]}" -m 0755 "$T/nvcurve" "$DESTDIR$PREFIX/bin/"
+install "${own[@]}" -m 0755 "$T/nvcurve-sensors" "$T/nvcurve-boot-guard" "$T/nvcurve" "$T/nvcurve-gpustress" "$DESTDIR$LIBEXEC/"
+# The CLI lives in LIBEXEC (the boot service runs it from there). It is put on PATH only when that
+# cannot hide or replace another `nvcurve` (Centurion installs its own to /usr/bin).
+# Only replace our own symlink. A previous regular file has no ownership marker.
+NVCLI="$DESTDIR$PREFIX/bin/nvcurve"
+EXISTING="$(command -v nvcurve 2>/dev/null || true)"
+if [[ -L $NVCLI && $(readlink "$NVCLI") == "$LIBEXEC/nvcurve" ]] ||
+   [[ ! -e $NVCLI && ! -L $NVCLI && ( -n $DESTDIR || -z $EXISTING ) ]]; then
+    ln -sfn "$LIBEXEC/nvcurve" "$NVCLI"
+    CLI_NOTE="$PREFIX/bin/nvcurve -> $LIBEXEC/nvcurve"
+else
+    CLI_NOTE="run $LIBEXEC/nvcurve"
+    warn "Kept the existing nvcurve at ${EXISTING:-$NVCLI}. This project's CLI: $LIBEXEC/nvcurve"
+fi
 DESTDIR="$DESTDIR" cmake --install gui/build --strip >/dev/null
-ok "Binaries installed: $PREFIX/bin/nvcurve-gui, $PREFIX/bin/nvcurve, $LIBEXEC"
+ok "Binaries installed: $PREFIX/bin/nvcurve-gui, $LIBEXEC (CLI: $CLI_NOTE)"
 
 # ─── Profiles directory ─────────────────────────────────────────────────
 install -d "${own[@]}" -m 0755 "$DESTDIR$PROFILES_DIR"
@@ -183,7 +195,21 @@ ok "Polkit action + rules installed (security level $SECLEVEL)"
 # ─── Boot services (installed, never enabled) ───────────────────────────
 subst() { sed -e "s|@BINDIR@|$PREFIX/bin|g" -e "s|@LIBEXEC@|$LIBEXEC|g" "$1"; }
 install -d "${own[@]}" -m 0755 "$DESTDIR/etc/init.d" "$DESTDIR$UNITDIR"
-for s in nvcurve-autoload nvcurve-boot-guard; do
+# Earlier versions installed these services as nvcurve-autoload / nvcurve-boot-guard, names Centurion
+# uses too. Only a unit that points into this project's LIBEXEC is ours to retire; Centurion's is kept.
+for old in nvcurve-autoload nvcurve-boot-guard; do
+    for f in "$DESTDIR$UNITDIR/$old.service" "$DESTDIR/etc/init.d/$old"; do
+        if [[ -f $f ]] && grep -qF "$LIBEXEC/" "$f"; then
+            if [[ -z $DESTDIR ]]; then
+                systemctl disable --now "$old.service" >/dev/null 2>&1 || true
+                rc-update del "$old" >/dev/null 2>&1 || true
+            fi
+            rm -f "$f"
+            warn "Retired the old service name $old (now nvcurve-gui-${old#nvcurve-}); re-enable the new one if you used it."
+        fi
+    done
+done
+for s in nvcurve-gui-autoload nvcurve-gui-boot-guard; do
     subst "packaging/openrc/$s" > "$DESTDIR/etc/init.d/$s"
     subst "packaging/systemd/$s.service" > "$DESTDIR$UNITDIR/$s.service"
     chmod 0755 "$DESTDIR/etc/init.d/$s"
@@ -227,12 +253,13 @@ fi
 echo
 ok "Installation complete."
 echo "  Run with:            nvcurve-gui"
+echo "  Command line:        $CLI_NOTE"
 echo "  Profiles directory:  $PROFILES_DIR"
 echo "  Boot-time profile (optional; the guard pauses it after a boot that crashed right after applying it):"
 if [[ -d /run/systemd/system ]]; then
-    echo "    systemctl enable nvcurve-autoload.service    # applies the GUI's ★ Default profile at boot"
+    echo "    systemctl enable nvcurve-gui-autoload.service # applies the GUI's ★ Default profile at boot"
 else
-    echo "    rc-update add nvcurve-autoload default       # applies the GUI's ★ Default profile at boot"
+    echo "    rc-update add nvcurve-gui-autoload default    # applies the GUI's ★ Default profile at boot"
 fi
 echo "  Resume after a trip: sudo $LIBEXEC/nvcurve-boot-guard reset"
 echo "  Uninstall with:      sudo ./uninstall.sh"

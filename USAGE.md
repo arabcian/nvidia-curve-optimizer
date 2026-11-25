@@ -49,7 +49,7 @@ Below it, the profile row:
   it does **not** apply them. The default profile is marked with ★.
 - **Apply Profile** — apply the selected saved profile to the GPU as it is.
 - **★ Default** — toggles whether the selected profile is the boot-time
-  auto-load profile (used by `nvcurve autoload` / the `nvcurve-autoload` service).
+  auto-load profile (used by `nvcurve autoload` / the `nvcurve-gui-autoload` service).
 - **Delete** — delete the selected profile (and clear the default if it was one).
 
 ### V/F Curve
@@ -96,6 +96,14 @@ Voltage (mV) on the X axis, frequency (MHz) on the Y axis.
 - **Reset All** — everything back to stock: curve offsets, NVML offsets in every
   P-state, core and VRAM clock locks, power limit, PowerMizer → Auto (asks first).
 
+### Driver options
+
+*Driver options…* (next to the profile buttons) lists the managed `nvidia` / `nvidia_drm` module
+options with their running value, where else they are set, and the value nvcurve manages. *Apply
+(next boot)* rewrites `/etc/modprobe.d/zz-nvcurve-nvidia.conf` through the polkit-gated root helper;
+rebuild the initramfs if it carries the nvidia modules. A row left on *not set* keeps the driver
+default.
+
 ### Log
 
 Every operation's result — successes, errors, and warnings the core reports (for
@@ -114,7 +122,7 @@ They are JSON files under `/etc/nvcurve/profiles/`; names are letters, digits, s
 2. **Apply Offsets**, with **Trial apply** ticked while testing, and confirm it behaves.
 3. **Save As…** with a name (`quiet`, `max-perf`, `undervolt`).
 4. Optionally mark it **★ Default** and enable the boot service
-   (`systemctl enable nvcurve-autoload.service`, or `rc-update add nvcurve-autoload default`).
+   (`systemctl enable nvcurve-gui-autoload.service`, or `rc-update add nvcurve-gui-autoload default`).
    The boot guard pauses the autoload after a boot that died right after applying it;
    resume it with `sudo nvcurve-boot-guard reset` (installed under the libexec directory,
    `/usr/local/libexec/nvcurve-gui/` by default).

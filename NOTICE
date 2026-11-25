@@ -2,8 +2,8 @@ nvcurve-gui
 Copyright (C) 2026 arabcian
 
 Extracted from Centurion (https://github.com/arabcian/centurion): the nvcurve
-crate, the NVIDIA Curve tab, the privileged-helper runner, the theme system,
-the polkit actions/rules and the boot guard.
+crate, the NVIDIA Curve tab, the Vulkan GPU stress test and its GUI, the
+privileged-helper runner, the theme system, the polkit actions/rules and the boot guard.
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software

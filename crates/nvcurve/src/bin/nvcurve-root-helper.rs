@@ -1,5 +1,5 @@
 //! nvcurve root helper — pkexec target for the NVIDIA tab.
-//! Same JSON protocol as the original Python root_helper.py:
+//! Port of apps/nvcurve/root_helper.py; same JSON protocol:
 //!   stdin  {"op": "<name>", ...op fields at top level...}
 //!   stdout {"ok": bool, "message"|"error": str}
 //!
@@ -9,7 +9,7 @@
 
 use nvcurve::atomicio::{ensure_dir, write_bytes, write_json};
 use nvcurve::config::{Config, PERSISTENT_CONFIG_FILE};
-use nvcurve::hal::{gpu, limits, vfcurve};
+use nvcurve::hal::limits;
 use nvcurve::profiles::apply::run_autoload;
 use nvcurve::profiles::native::is_canonical_profile_name;
 use nvcurve::{logging, ops};
@@ -49,17 +49,23 @@ fn name_param<'a>(p: &'a Obj, key: &str) -> Result<&'a str, String> {
 /// Result files for the unprivileged GUI: root-owned 0755 dir that must not
 /// be a symlink; the file is replaced atomically (never opened through a
 /// pre-planted link).
-fn write_result(file: &str, v: &Value) {
+fn write_result(file: &str, v: &Value, request: &Obj) {
+    // Correlate the atomic result with the caller, not filesystem wall-clock time.
+    let mut result = v.clone();
+    if let Some(id) = request.get("request_id").and_then(Value::as_str)
+        .filter(|id| id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')) {
+        result["request_id"] = json!(id);
+    }
     let dir = Path::new(RESULT_DIR);
     if let Ok(md) = std::fs::symlink_metadata(dir) {
         if !md.is_dir() { log::warn!("{RESULT_DIR} is not a directory — result not written"); return; }
     }
     if ensure_dir(dir, 0o755).is_err() { return; }
-    if let Err(e) = write_json(&dir.join(file), v, 0o644) { log::warn!("result write failed: {e}"); }
+    if let Err(e) = write_json(&dir.join(file), &result, 0o644) { log::warn!("result write failed: {e}"); }
 }
 
-fn refresh_result(file: &str) {
-    if let Ok(v) = ops::read_curve_retry(0, 2) { write_result(file, &v); }
+fn refresh_result(file: &str, request: &Obj) {
+    if let Ok(v) = ops::read_curve_retry(0, 2) { write_result(file, &v, request); }
 }
 
 fn is_int(v: &Value) -> Option<i64> { v.as_i64().filter(|_| v.is_i64() || v.is_u64()) }
@@ -129,10 +135,26 @@ fn validate_profile_data(d: &Obj) -> Result<(), String> {
 
 // ── ops ─────────────────────────────────────────────────────────────────────
 
-fn op_read_gpu_curve(_: &Obj) -> OpResult {
+fn op_read_gpu_curve(p: &Obj) -> OpResult {
     let v = ops::read_curve_retry(0, 2).map_err(|e| format!("Failed to read V/F curve: {e}"))?;
-    write_result(READ_RESULT, &v);
+    write_result(READ_RESULT, &v, p);
     Ok("Curve read successfully.".into())
+}
+
+// Optional preflight for the GUI's edited curve. Legacy named profiles keep their
+// existing hardware validation path. This is layout/name identity, not a UUID.
+fn check_expected_curve(p: &Obj, observed: &Value) -> Result<(), String> {
+    let (Some(name), Some(points)) = (p.get("expected_gpu").and_then(Value::as_str), p.get("expected_points").and_then(Value::as_array)) else {
+        return Err("Incomplete curve identity".into());
+    };
+    if name.is_empty() || points.is_empty() || points.len() > MAX_CURVE_POINTS as usize || observed["gpu"].as_str() != Some(name) {
+        return Err("GPU or curve identity changed; read the curve again".into());
+    }
+    let rows = observed["vf_curve"].as_array().ok_or("Missing live curve")?;
+    let live: Vec<Value> = rows.iter().filter(|r| r["domain"] == "gpu")
+        .map(|r| json!([r["index"], r["volt_uV"]])).collect();
+    if &live != points { return Err("GPU voltage layout changed; read the curve again".into()); }
+    Ok(())
 }
 
 fn op_apply_gpu_offsets(p: &Obj) -> OpResult {
@@ -146,11 +168,25 @@ fn op_apply_gpu_offsets(p: &Obj) -> OpResult {
             return Err(format!("profile_data 'name' ({embedded:?}) does not match profile_name ({name:?})"));
         }
     }
+    let expected_gpu = p.get("expected_gpu").and_then(Value::as_str).ok_or("Missing expected GPU")?;
+    let expected_points = p.get("expected_points").ok_or("Missing expected points")?;
+    let expected_device = p.get("expected_device").filter(|v| v.is_object()).ok_or("Missing verified GPU identity; update GUI and read curve again")?;
+    let observed = ops::read_curve_retry(0, 2)?;
+    check_expected_curve(p, &observed)?;
+    if &observed["device_identity"] != expected_device { return Err("GPU device identity changed; read curve again".into()); }
     ensure_dir(Path::new(PROFILES_DIR), 0o755).map_err(|e| format!("Could not prepare {PROFILES_DIR}: {e}"))?;
     write_bytes(&profile_file(name), text.as_bytes(), 0o644).map_err(|e| format!("Could not write profile: {e}"))?;
 
-    let msg = ops::apply_profile_verified(0, name, &config(), 3)?;
-    refresh_result(APPLY_RESULT);
+    let out = nvcurve::profiles::apply::apply_profile_checked(0,name,&config(),Some((expected_gpu,expected_points,expected_device)))?;
+    if !out.errors.is_empty() { return Err(out.errors.join("; ")); }
+    let mut msg = format!("Profile '{name}' applied and verified.");
+    for warning in out.warnings { msg.push('\n'); msg.push_str(&warning); }
+    if let Ok(mut v) = ops::read_curve_retry(0, 2) {
+        // Receipt belongs to the actual checked apply, not the earlier Validate button.
+        v["apply_plan"] = json!({"schema":1,"device_identity":expected_device,
+            "points":out.point_plan,"scope":"gpu_point_plan_only"});
+        write_result(APPLY_RESULT, &v, p);
+    }
     Ok(msg)
 }
 
@@ -158,17 +194,14 @@ fn op_apply_named_profile(p: &Obj) -> OpResult {
     let name = name_param(p, "name")?;
     if !profile_file(name).is_file() { return Err(format!("Profile not found: {name}")); }
     let msg = ops::apply_profile_verified(0, name, &config(), 3).map_err(|e| format!("Apply failed: {e}"))?;
-    refresh_result(APPLY_RESULT);
+    refresh_result(APPLY_RESULT, p);
     Ok(msg)
 }
 
-fn op_reset_gpu_curve(_: &Obj) -> OpResult {
-    let (g, _) = gpu::get_gpu(0).map_err(|e| format!("Reset failed: {e}"))?;
-    let (rc, d) = vfcurve::reset_all_offsets(g, false);
-    if rc != 0 { return Err(format!("Reset write failed: {d}")); }
-    let _ = limits::reset_gpu_locked_clocks(0);  // stock curve = no cap either
-    refresh_result(RESET_RESULT);
-    Ok("Reset successful.".into())
+fn op_reset_gpu_curve(p: &Obj) -> OpResult {
+    let msg = ops::reset_gpu_curve_verified(0)?;
+    refresh_result(RESET_RESULT, p);
+    Ok(msg)
 }
 
 fn op_set_vram_memlock(p: &Obj) -> OpResult {
@@ -203,13 +236,23 @@ fn op_reset_gpu_clocklock(_: &Obj) -> OpResult {
     Ok("GPU core clock unlocked (back to the V/F curve's own maximum).".into())
 }
 
-fn op_reset_all(_: &Obj) -> OpResult {
+fn op_reset_all(p: &Obj) -> OpResult {
     let (done, errs) = ops::reset_everything(0);
-    refresh_result(RESET_RESULT);
+    refresh_result(RESET_RESULT, p);
     let mut msg = done.join("\n");
     if !errs.is_empty() { return Err(format!("{}{}{}", msg, if msg.is_empty() { "" } else { "\n" }, errs.join("; "))); }
     if msg.is_empty() { msg = "Already at stock.".into(); }
     Ok(msg)
+}
+
+fn op_nvreg_describe(_: &Obj) -> OpResult {
+    Ok(nvcurve::nvreg::describe().to_string())
+}
+
+fn op_nvreg_set(p: &Obj) -> OpResult {
+    let values = p.get("values").and_then(Value::as_object).ok_or("values must be an object")?;
+    let n = nvcurve::nvreg::set(values)?;
+    Ok(json!({"written": n, "file": nvcurve::nvreg::MANAGED_FILE}).to_string())
 }
 
 fn op_set_powermizer(p: &Obj) -> OpResult {
@@ -289,6 +332,8 @@ fn dispatch(op: &str) -> Option<fn(&Obj) -> OpResult> {
         "reset_all" => op_reset_all,
         "set_powermizer" => op_set_powermizer,
         "read_sensors" => op_read_sensors,
+        "nvreg_describe" => op_nvreg_describe,
+        "nvreg_set" => op_nvreg_set,
         "set_vram_memlock" => op_set_vram_memlock,
         "reset_vram_memlock" => op_reset_vram_memlock,
         "set_gpu_clocklock" => op_set_gpu_clocklock,
@@ -306,12 +351,14 @@ fn run() -> Value {
         return json!({"ok": false, "error": "root_helper must run as root"});
     }
     // pkexec passes the caller's umask through; pin it once for every op.
-    // No core dumps either: a crash must not leave root memory (NvAPI session state)
-    // in a file other tools might pick up.
+    // No core dumps either a crash must not leave
+    // root memory (NvAPI session state) in a file other tools might pick up.
     unsafe {
         libc::umask(0o022);
         let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         libc::setrlimit(libc::RLIMIT_CORE, &zero);
+        // Hard run-time bound: the GUI cannot kill a root helper.
+        libc::alarm(180);
     }
     logging::init(log::Level::Info, true);
 
@@ -335,11 +382,9 @@ fn run() -> Value {
     let Some(handler) = dispatch(op) else {
         return json!({"ok": false, "error": format!("Unknown or disallowed op: {}", obj.get("op").cloned().unwrap_or(Value::Null))});
     };
-    let _lock = if op == "read_sensors" { None } else {
-        match ops::gpu_write_lock() {
-            Ok(f) => Some(f),
-            Err(e) => return json!({"ok": false, "error": e}),
-        }
+    let _lock = match ops::gpu_write_lock() {
+        Ok(f) => f,
+        Err(e) => return json!({"ok": false, "error": e}),
     };
     match handler(obj) {
         Ok(m) => json!({"ok": true, "message": m}),
@@ -348,7 +393,8 @@ fn run() -> Value {
 }
 
 fn main() {
-    let v = run();
+    let mut v = run();
+    if let Some(o) = v.as_object_mut() { o.insert("helper_version".into(), json!(env!("CARGO_PKG_VERSION"))); }
     println!("{v}");
     std::process::exit(if v["ok"] == true { 0 } else { 1 });
 }
@@ -357,6 +403,13 @@ fn main() {
 mod tests {
     use super::*;
     fn o(v: Value) -> Obj { v.as_object().unwrap().clone() }
+    #[test]
+    fn edited_curve_identity() {
+        let observed = json!({"gpu":"A", "vf_curve":[{"domain":"gpu","index":3,"volt_uV":600000}]});
+        assert!(check_expected_curve(&o(json!({"expected_gpu":"A","expected_points":[[3,600000]]})), &observed).is_ok());
+        assert!(check_expected_curve(&o(json!({"expected_gpu":"B","expected_points":[[3,600000]]})), &observed).is_err());
+        assert!(check_expected_curve(&o(json!({"expected_gpu":"A","expected_points":[[4,600000]]})), &observed).is_err());
+    }
     #[test]
     fn schema() {
         assert!(validate_profile_data(&o(json!({"name":"A (b)","curve_deltas":{"0":-15000,"126":0},

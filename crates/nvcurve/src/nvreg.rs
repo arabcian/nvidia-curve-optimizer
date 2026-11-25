@@ -1,0 +1,408 @@
+//! NVIDIA kernel module options (modprobe.d) — a curated, validated subset.
+//!
+//! nvcurve owns one file, loaded last (`zz-` sorts after the usual nvidia.conf),
+//! so its values win over other modprobe.d files; the kernel command line
+//! still wins over all of them. Changes apply the next time the module loads
+//! (reboot); an initramfs that carries the nvidia modules must be rebuilt.
+
+use serde_json::{json, Map, Value};
+use std::path::{Path, PathBuf};
+
+pub const MANAGED_FILE: &str = "/etc/modprobe.d/zz-nvcurve-nvidia.conf";
+const DIRS: &[&str] = &["/etc/modprobe.d", "/run/modprobe.d", "/usr/local/lib/modprobe.d", "/usr/lib/modprobe.d", "/lib/modprobe.d"];
+
+#[derive(Clone, Copy)]
+pub enum Kind { Bool, Choice(&'static [(&'static str, &'static str)]), Int(i64, i64), Path, Dwords }
+
+pub struct Param { pub module: &'static str, pub name: &'static str, pub kind: Kind, pub desc: &'static str }
+
+const fn p(module: &'static str, name: &'static str, kind: Kind, desc: &'static str) -> Param { Param { module, name, kind, desc } }
+
+pub const PARAMS: &[Param] = &[
+    p("nvidia", "NVreg_DynamicPowerManagement", Kind::Choice(&[("0x00", "off (dGPU never powers down)"), ("0x01", "coarse"), ("0x02", "fine (RTD3, laptop default)"), ("0x03", "auto (driver decides)")]),
+      "Runtime D3 power management of the dGPU. 'fine' lets the GPU power off when idle (biggest battery win on a hybrid laptop); 'off' keeps it powered - a test when resume from idle misbehaves (GSP timeouts right after a game starts)."),
+    p("nvidia", "NVreg_DynamicPowerManagementVideoMemoryThreshold", Kind::Int(0, 1024),
+      "MB of video memory in use below which the GPU may still power off (fine mode); contents are copied to system RAM. 0 = never power off with VRAM in use."),
+    p("nvidia", "NVreg_PreserveVideoMemoryAllocations", Kind::Bool,
+      "Save all video memory across suspend/hibernate (needs the nvidia-suspend hooks). Without it a Wayland session or a running game can lose its GPU state on resume."),
+    p("nvidia", "NVreg_TemporaryFilePath", Kind::Path,
+      "Where video memory is saved on suspend when PreserveVideoMemoryAllocations=1. Must be on a real disk with room for the whole VRAM (e.g. /var/tmp), not a tmpfs."),
+    p("nvidia", "NVreg_EnableS0ixPowerManagement", Kind::Bool,
+      "Use S0ix (modern standby) power management for suspend instead of S3. Only when the platform suspends to s2idle."),
+    p("nvidia", "NVreg_EnableGpuFirmware", Kind::Bool,
+      "Run the resource manager on the GPU's GSP firmware. Blackwell (RTX 50) and the open kernel modules always use GSP - 0 has no effect there."),
+    p("nvidia", "NVreg_UsePageAttributeTable", Kind::Bool,
+      "Use the kernel's PAT for write-combined mappings (1, recommended) instead of the driver's legacy MTRR path."),
+    p("nvidia", "NVreg_InitializeSystemMemoryAllocations", Kind::Bool,
+      "Zero system memory before handing it to the GPU (1 = default, safer). 0 saves a little CPU time on large allocations."),
+    p("nvidia", "NVreg_EnableMSI", Kind::Bool,
+      "Message-signalled interrupts (1, default). 0 falls back to legacy INTx - only for debugging interrupt problems."),
+    p("nvidia", "NVreg_EnableResizableBar", Kind::Bool,
+      "Let the driver resize BAR1 when the firmware supports Resizable BAR."),
+    p("nvidia", "NVreg_RegistryDwords", Kind::Dwords,
+      "Raw driver registry keys, 'Key=Value;Key=Value' (e.g. RMUseSwI2c=0x01). Only for keys you know - wrong ones can stop the GPU from initializing."),
+    p("nvidia_drm", "modeset", Kind::Bool,
+      "Kernel modesetting for nvidia-drm. Required for Wayland and for PRIME sync; recent drivers default to 1."),
+    p("nvidia_drm", "fbdev", Kind::Bool,
+      "nvidia-drm's own framebuffer console (needs modeset=1). Recent drivers default to 1."),
+];
+
+/// Root-owned regular file whose whole parent chain only root can modify: the only kind of
+/// binary this root helper runs.
+fn trusted_path(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(real) = std::fs::canonicalize(path) else { return false };
+    let Ok(md) = std::fs::metadata(&real) else { return false };
+    if !md.is_file() || md.uid() != 0 || md.mode() & 0o6022 != 0 { return false; }
+    let mut dir = real.parent();
+    while let Some(d) = dir {
+        match std::fs::metadata(d) {
+            Ok(m) if m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0 => {}
+            _ => return false,
+        }
+        dir = d.parent();
+    }
+    true
+}
+
+fn kill_reap(child: &mut std::process::Child) {
+    let _ = child.kill();
+    for _ in 0..50 {
+        if !matches!(child.try_wait(), Ok(None)) { return; }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Runs a root-trusted binary with a clean environment and a hard timeout.
+/// Returns (success, stdout). Never a shell; stdin/stderr closed.
+fn run_tool(bin: &Path, args: &[&str], timeout: std::time::Duration) -> Option<(bool, String)> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(bin).args(args).env_clear().env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("LC_ALL", "C").current_dir("/").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
+        .spawn().ok()?;
+    let mut out = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = (&mut out).take(64 * 1024).read_to_end(&mut v);
+        let _ = tx.send(v);
+    });
+    let Ok(bytes) = rx.recv_timeout(timeout) else { kill_reap(&mut child); return None; };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(10)),
+            _ => { kill_reap(&mut child); return None; }
+        }
+    };
+    Some((status.success(), String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+pub fn find(name: &str) -> Option<&'static Param> { PARAMS.iter().find(|p| p.name == name) }
+
+fn num(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) { i64::from_str_radix(h, 16).ok() } else { s.parse().ok() }
+}
+
+/// Canonical value or an error.
+pub fn validate(p: &Param, v: &str) -> Result<String, String> {
+    let v = v.trim();
+    match p.kind {
+        Kind::Bool => match v { "0" | "N" | "n" => Ok("0".into()), "1" | "Y" | "y" => Ok("1".into()), _ => Err(format!("{}: must be 0 or 1", p.name)) },
+        Kind::Choice(opts) => {
+            let n = num(v).ok_or_else(|| format!("{}: not a number", p.name))?;
+            opts.iter().find(|(o, _)| num(o) == Some(n)).map(|(o, _)| o.to_string()).ok_or_else(|| format!("{}: not offered", p.name))
+        }
+        Kind::Int(lo, hi) => {
+            let n = num(v).filter(|n| (lo..=hi).contains(n)).ok_or_else(|| format!("{}: must be {lo}..{hi}", p.name))?;
+            Ok(n.to_string())
+        }
+        Kind::Path => {
+            let ok = v.starts_with('/') && v.len() <= 200 && !v.split('/').any(|c| c == "..")
+                && v.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_.-".contains(&b));
+            if !ok { return Err(format!("{}: absolute path of letters, digits, / _ . - only", p.name)); }
+            // The driver dumps video memory there at suspend: the directory and every parent must be
+            // root-owned, and a world-writable one sticky (/var/tmp passes, a user's directory does not).
+            if !root_dir_chain(Path::new(v)) {
+                return Err(format!("{}: {v} must be an existing directory that only root controls (root-owned, \
+                                    not writable by other users unless sticky, like /var/tmp)", p.name));
+            }
+            Ok(v.into())
+        }
+        Kind::Dwords => {
+            let ok = !v.is_empty() && v.len() <= 512 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b"_=;,".contains(&b))
+                && v.split(';').filter(|e| !e.is_empty()).all(|e| e.split_once('=').is_some_and(|(k, x)| !k.is_empty() && num(x).is_some()));
+            if ok { Ok(v.into()) } else { Err(format!("{}: expected Key=Value;Key=Value with numeric values", p.name)) }
+        }
+    }
+}
+
+/// `dir` (resolved) and all its parents are root-owned directories that no other user can
+/// rename or replace entries in.
+fn root_dir_chain(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(real) = std::fs::canonicalize(dir) else { return false };
+    real.ancestors().all(|d| std::fs::metadata(d).is_ok_and(|m| {
+        m.is_dir() && m.uid() == 0
+            && (m.mode() & 0o020 == 0 || m.gid() == 0)
+            && (m.mode() & 0o002 == 0 || m.mode() & 0o1000 != 0)
+    }))
+}
+
+/// Value as the running module reports it, normalised like validate().
+fn running(p: &Param) -> Option<String> {
+    let raw = if p.module == "nvidia" {
+        let s = std::fs::read_to_string("/proc/driver/nvidia/params").ok()?;
+        let key = p.name.strip_prefix("NVreg_")?;
+        s.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix(':').map(|v| v.trim().trim_matches('"').to_owned()))?
+    } else {
+        std::fs::read_to_string(format!("/sys/module/{}/parameters/{}", p.module, p.name)).ok()?.trim().to_owned()
+    };
+    Some(match p.kind {
+        Kind::Bool => match raw.as_str() { "Y" | "1" => "1".into(), "N" | "0" => "0".into(), _ => raw },
+        Kind::Choice(opts) => num(&raw).and_then(|n| opts.iter().find(|(o, _)| num(o) == Some(n))).map_or(raw, |(o, _)| o.to_string()),
+        _ => raw,
+    })
+}
+
+/// modprobe.d files in load order (a same-named file in an earlier directory masks the later one).
+fn conf_files() -> Vec<PathBuf> {
+    let mut by_name: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
+    for d in DIRS.iter().rev() {
+        for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.ends_with(".conf") && e.path().is_file() { by_name.insert(n, e.path()); }
+        }
+    }
+    by_name.into_values().collect()
+}
+
+/// (source, module, name, value) for every nvidia option set anywhere, in effect order.
+fn configured() -> Vec<(String, String, String, String)> {
+    let mut out = Vec::new();
+    let mut push = |src: &str, module: &str, kv: &str| {
+        let module = module.replace('-', "_");
+        if module != "nvidia" && module != "nvidia_drm" { return; }
+        if let Some((k, v)) = kv.split_once('=') { out.push((src.to_owned(), module, k.to_owned(), v.trim_matches('"').to_owned())); }
+    };
+    for f in conf_files() {
+        let Ok(s) = std::fs::read_to_string(&f) else { continue };
+        for l in s.lines() {
+            let l = l.split('#').next().unwrap_or("").trim();
+            let mut w = l.split_whitespace();
+            if w.next() != Some("options") { continue; }
+            let Some(m) = w.next() else { continue };
+            for kv in w { push(&f.display().to_string(), m, kv); }
+        }
+    }
+    if let Ok(c) = std::fs::read_to_string("/proc/cmdline") {
+        for t in c.split_whitespace() {
+            if let Some((m, kv)) = t.split_once('.') { push("kernel command line", m, kv); }
+        }
+    }
+    out
+}
+
+/// Installed-module metadata is authoritative for discovery, not for semantic safety.
+#[derive(Clone, Debug)]
+struct Discovered { module: &'static str, name: String, desc: String, ty: String }
+
+fn parse_modinfo(module: &'static str, text: &str) -> Vec<Discovered> {
+    let mut out = Vec::new();
+    for line in text.lines().take(2048) {
+        let Some((name, desc)) = line.split_once(':') else { continue };
+        if name.is_empty() || name.len() > 128 || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') { continue; }
+        let desc = desc.trim();
+        let ty = desc.strip_suffix(')').and_then(|s| s.rsplit_once('(')).map(|(_, t)| t.trim()).unwrap_or("");
+        out.push(Discovered { module, name: name.into(), desc: desc.chars().take(2048).collect(), ty: ty.into() });
+    }
+    out
+}
+fn discover() -> Vec<Discovered> {
+    let Some(bin) = ["/usr/sbin/modinfo", "/sbin/modinfo", "/usr/bin/modinfo", "/bin/modinfo"].iter()
+        .map(PathBuf::from).find(|p| trusted_path(p)) else { return vec![] };
+    let mut out = Vec::new();
+    for module in ["nvidia", "nvidia_drm"] {
+        if let Some((true, text)) = run_tool(&bin, &["-p", module], std::time::Duration::from_secs(3)) {
+            if text.len() < 64 * 1024 { out.extend(parse_modinfo(module, &text)); }
+        }
+    }
+    out
+}
+fn unique<'a>(catalog: &'a [Discovered], name: &str) -> Option<&'a Discovered> {
+    let mut matches = catalog.iter().filter(|p| p.name == name);
+    let p = matches.next()?;
+    if matches.next().is_some() { None } else { Some(p) }
+}
+fn dynamic_kind(ty: &str) -> Option<&'static str> {
+    match ty { "bool" => Some("bool"), "int" | "uint" | "long" | "ulong" | "short" | "ushort" | "byte" | "ullong" => Some("scalar"), _ => None }
+}
+fn validate_dynamic(p: &Discovered, raw: &str) -> Result<String, String> {
+    // No unreviewed string/array/command syntax in a root-owned modprobe file.
+    let raw = raw.trim();
+    let err = || format!("{}: unsupported type or out-of-range value ({})", p.name, p.ty);
+    if p.ty == "bool" { return match raw { "0" | "N" | "n" => Ok("0".into()), "1" | "Y" | "y" => Ok("1".into()), _ => Err(err()) }; }
+    if raw.len() > 24 { return Err(err()); }
+    let n = if let Some(h) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) { i128::from_str_radix(h, 16).ok() } else { raw.parse::<i128>().ok() }.ok_or_else(|| err())?;
+    let (lo, hi) = match p.ty.as_str() {
+        "int" => (i32::MIN as i128, i32::MAX as i128), "uint" => (0, u32::MAX as i128),
+        "short" => (i16::MIN as i128, i16::MAX as i128), "ushort" => (0, u16::MAX as i128),
+        "byte" => (0, u8::MAX as i128), "long" => (isize::MIN as i128, isize::MAX as i128),
+        "ulong" => (0, usize::MAX as i128), "ullong" => (0, u64::MAX as i128), _ => return Err(err()),
+    };
+    if !(lo..=hi).contains(&n) { return Err(err()); }
+    Ok(n.to_string())
+}
+fn running_dynamic(p: &Discovered) -> Option<String> {
+    if let Some(known) = find(&p.name).filter(|k| k.module == p.module) { return running(known); }
+    if p.module == "nvidia" {
+        let data = std::fs::read_to_string("/proc/driver/nvidia/params").unwrap_or_default();
+        let key = p.name.strip_prefix("NVreg_").unwrap_or(&p.name);
+        if let Some(v) = data.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix(':')) { return Some(v.trim().trim_matches('"').to_owned()); }
+    }
+    std::fs::read_to_string(format!("/sys/module/{}/parameters/{}", p.module, p.name)).ok().map(|v| v.trim().to_owned())
+}
+pub fn describe() -> Value {
+    let conf = configured();
+    let catalog = discover();
+    let loaded = Path::new("/proc/driver/nvidia/params").is_file();
+    let params: Vec<Value> = catalog.iter().map(|p| {
+        let srcs: Vec<Value> = conf.iter().filter(|c| c.1 == p.module && c.2 == p.name)
+            .map(|c| json!({"source": c.0, "value": c.3})).collect();
+        let managed = conf.iter().rfind(|c| c.0 == MANAGED_FILE && c.1 == p.module && c.2 == p.name).map(|c| c.3.clone());
+        let next = conf.iter().rfind(|c| c.1 == p.module && c.2 == p.name).map(|c| c.3.clone());
+        let known = find(&p.name).filter(|k| k.module == p.module);
+        let (kind, extra) = if unique(&catalog, &p.name).is_none() { ("readonly", json!(null)) }
+        else if let Some(k) = known { match k.kind {
+            Kind::Bool => ("bool", json!(null)),
+            Kind::Choice(o) => ("choice", json!(o.iter().map(|(v, l)| json!([v, l])).collect::<Vec<_>>())),
+            Kind::Int(lo, hi) => ("int", json!([lo, hi])),
+            Kind::Path => ("path", json!(null)), Kind::Dwords => ("dwords", json!(null)),
+        }} else { (dynamic_kind(&p.ty).unwrap_or("readonly"), json!(null)) };
+        let description = if let Some(k)=known { format!("{} — {}", p.desc, k.desc) } else { p.desc.clone() };
+        json!({"module": p.module, "name": p.name, "kind": kind, "options": extra, "desc": description,
+               "discovered_type": p.ty, "reviewed": known.is_some(), "running": running_dynamic(p), "sources": srcs, "managed": managed, "next_boot": next})
+    }).collect();
+    let unavailable: Vec<Value> = conf.iter().filter(|c| c.0 == MANAGED_FILE && (unique(&catalog, &c.2).is_none() || !catalog.iter().any(|p| p.module == c.1 && p.name == c.2)))
+        .map(|c| json!({"module":c.1,"name":c.2,"value":c.3})).collect();
+    json!({"ok": !catalog.is_empty(), "error": if catalog.is_empty() { "modinfo could not discover NVIDIA module parameters" } else { "" },
+           "loaded": loaded, "file": MANAGED_FILE, "params": params, "unavailable_saved":unavailable})
+}
+
+/// Rewrites nvcurve's file from `values` (name -> value; null or absent = not set).
+pub fn set(values: &Map<String, Value>) -> Result<usize, String> {
+    let mut lines: Vec<(&str, Vec<String>)> = vec![("nvidia", vec![]), ("nvidia_drm", vec![])];
+    let catalog = discover();
+    if catalog.is_empty() { return Err("modinfo could not verify installed NVIDIA options; file unchanged".into()); }
+    // Refuse to silently erase a setting which the installed driver no longer exposes.
+    for c in configured().iter().filter(|c| c.0 == MANAGED_FILE) {
+        let Some(p)=unique(&catalog,&c.2).filter(|p| p.module==c.1) else { return Err(format!("{}: saved option unavailable; file unchanged",c.2)); };
+        if find(&p.name).filter(|k| k.module==p.module).is_none() && dynamic_kind(&p.ty).is_none() {
+            return Err(format!("{}: saved option has unsupported type; file unchanged",p.name));
+        }
+    }
+    for (k, v) in values {
+        let p = unique(&catalog, k).ok_or_else(|| format!("{k}: not an unambiguous installed module option"))?;
+        let v = match v {
+            Value::Null => continue,
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => if *b { "1".into() } else { "0".into() },
+            _ => return Err(format!("{k}: bad value")),
+        };
+        let v = if let Some(known)=find(k).filter(|known| known.module==p.module) { validate(known, &v)? } else { validate_dynamic(p, &v)? };
+        lines.iter_mut().find(|l| l.0 == p.module).unwrap().1.push(format!("{}={v}", p.name));
+    }
+    let n: usize = lines.iter().map(|l| l.1.len()).sum();
+    if n == 0 {
+        return match std::fs::remove_file(MANAGED_FILE) {
+            Ok(()) => Ok(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(format!("{MANAGED_FILE}: {e}")),
+        };
+    }
+    let mut body = String::from("# Written by nvcurve (NVIDIA → Driver options). Edit in the app;\n\
+                                 # applies the next time the module loads. Rebuild the initramfs if it carries nvidia.\n");
+    for (m, opts) in &lines { if !opts.is_empty() { body.push_str(&format!("options {m} {}\n", opts.join(" "))); } }
+    crate::atomicio::write_bytes(Path::new(MANAGED_FILE), body.as_bytes(), 0o644).map_err(|e| format!("{MANAGED_FILE}: {e}"))?;
+    Ok(n)
+}
+
+/// The managed options found in a saved copy of nvcurve's file, validated one by one: (name, canonical value).
+/// Everything else in the text — other modules, unknown or invalid options, `install` / `alias` /
+/// `blacklist` lines — is dropped. A later occurrence of an option replaces the earlier one.
+pub fn parse_saved(text: &str) -> Map<String, Value> {
+    let mut out = Map::new();
+    for l in text.lines() {
+        let l = l.split('#').next().unwrap_or("").trim();
+        let mut w = l.split_whitespace();
+        if w.next() != Some("options") { continue; }
+        let Some(module) = w.next().map(|m| m.replace('-', "_")) else { continue };
+        for kv in w {
+            let Some((k, v)) = kv.split_once('=') else { continue };
+            let Some(p) = find(k).filter(|p| p.module == module) else { continue };
+            if let Ok(v) = validate(p, v.trim_matches('"')) { out.insert(k.to_owned(), json!(v)); }
+        }
+    }
+    out
+}
+
+/// Restore from a backup: rebuilds nvcurve's file from the options of `text` that pass validation.
+/// Returns how many were written; with none, the current file is left as it is.
+pub fn restore_from(text: &str) -> Result<usize, String> {
+    let mut values = parse_saved(text);
+    let catalog = discover();
+    for line in text.lines() {
+        let mut tokens = line.split('#').next().unwrap_or("").split_whitespace();
+        if tokens.next()!=Some("options") { continue; }
+        let Some(module)=tokens.next().map(|s|s.replace('-',"_")) else {continue};
+        for kv in tokens {
+            let Some((key,value))=kv.split_once('=') else {continue};
+            if find(key).is_some() {continue;}
+            if let Some(p)=unique(&catalog,key).filter(|p|p.module==module) {
+                if let Ok(v)=validate_dynamic(p,value) { values.insert(key.to_owned(),json!(v)); }
+            }
+        }
+    }
+    if values.is_empty() { return Ok(0); }
+    set(&values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn discovered_types_and_injection() {
+        let catalog = parse_modinfo("nvidia", "NVreg_Test:example: description (uint)\nNVreg_Text:(charp)\nnot valid:(int)\nNVreg_Ambiguous:one (int)\nNVreg_Ambiguous:two (uint)\nFlag:(bool)");
+        assert_eq!(catalog.len(),5);
+        assert!(unique(&catalog,"NVreg_Ambiguous").is_none());
+        let p=unique(&catalog,"NVreg_Test").unwrap();
+        assert_eq!(validate_dynamic(p,"0xffffffff").unwrap(),"4294967295");
+        for bad in ["-1","4294967296","0;foo=1","1\noptions loop max_loop=5","1 2"] {assert!(validate_dynamic(p,bad).is_err());}
+        assert!(validate_dynamic(unique(&catalog,"NVreg_Text").unwrap(),"/tmp/x").is_err());
+        assert_eq!(validate_dynamic(unique(&catalog,"Flag").unwrap(),"Y").unwrap(),"1");
+    }
+    #[test]
+    fn validation() {
+        let d = find("NVreg_DynamicPowerManagement").unwrap();
+        assert_eq!(validate(d, "2").unwrap(), "0x02");
+        assert!(validate(d, "7").is_err());
+        let r = find("NVreg_RegistryDwords").unwrap();
+        assert!(validate(r, "RMUseSwI2c=0x01;Foo=1").is_ok());
+        assert!(validate(r, "a=1 b=2").is_err());
+        assert!(validate(find("NVreg_TemporaryFilePath").unwrap(), "/var/../etc").is_err());
+        assert_eq!(validate(find("modeset").unwrap(), "Y").unwrap(), "1");
+    }
+    #[test]
+    fn saved_file_is_reduced_to_managed_options() {
+        let m = parse_saved("# x\noptions nvidia NVreg_DynamicPowerManagement=0x02 NVreg_Bogus=1 NVreg_EnableMSI=7\n\
+                             install nvidia /bin/sh -c 'id > /tmp/x'\noptions nvidia-drm modeset=1\n\
+                             options loop max_loop=64\noptions nvidia modeset=1\nalias foo nvidia\n");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m["NVreg_DynamicPowerManagement"], "0x02");
+        assert_eq!(m["modeset"], "1");
+    }
+}

@@ -8,7 +8,7 @@
 use nvcurve::config::{Config, PERSISTENT_CONFIG_FILE};
 use nvcurve::hal::{gpu, limits, monitoring, snapshot, vfcurve};
 use nvcurve::nvapi::*;
-use nvcurve::profiles::apply::{apply_profile, run_autoload};
+use nvcurve::profiles::apply::run_autoload;
 use nvcurve::profiles::native::{list_profiles, load_profile, profile_path, save_profile, ProfileData};
 use nvcurve::safety::validate_write;
 use nvcurve::{logging, ops, CurveState, Domain, NvError};
@@ -23,6 +23,7 @@ usage: nvcurve [--gpu N] <command> [options]
 commands:
   read      [--full] [--json] [--raw]           Read the V/F curve
   inspect   [--point N | --range A-B]            Raw ClockBoostTable fields
+  validate-draft                                Read-only JSON draft preflight from stdin
   write     (--point N | --range A-B | --global) --delta MHz [--dry-run] [--max-delta MHz]
   write     --reset | --reset-all [--dry-run]
   snapshot  save | restore [--file F] | list
@@ -260,10 +261,10 @@ fn cmd_write(a: &Args, cfg: &Config) {
         let what = if reset_all { " (gpu + memory domain)" } else { "" };
         if dry { println!("DRY RUN — would reset all offsets to 0{what}."); return; }
         require_root();
-        let (g, _) = open_gpu(a);
-        let (rc, d) = if reset_all { vfcurve::reset_all_offsets(g, false) } else { vfcurve::reset_offsets(g, false) };
-        if rc != 0 { die(1, format!("Write failed ({rc}): {d}")); }
-        println!("Reset: all offsets set to 0{what}.");
+        let domain = if reset_all { None } else { Some(Domain::Gpu) };
+        let verified = ops::reset_vf_offsets_verified(a.gpu(), domain)
+            .unwrap_or_else(|e| die(1, format!("Reset failed: {e}")));
+        println!("{verified}{what}.");
         return;
     }
     let delta = delta.unwrap();
@@ -357,8 +358,8 @@ fn cmd_gpus() {
     let gpus = gpu::discover_gpus().unwrap_or_else(|e| die(1, format!("nvcurve: {e}")));
     if gpus.is_empty() { println!("No NVIDIA GPUs detected."); return; }
     for g in gpus {
-        let pci = g.pci_bus_id.map(|b| format!("PCI 0x{b:04x}")).unwrap_or_else(|| "PCI N/A".into());
-        println!("  [{}] {}  —  {}  —  {pci}", g.index, g.name, g.uuid.as_deref().unwrap_or("N/A"));
+        let pci = g.pci_address.as_deref().unwrap_or("PCI N/A");
+        println!("  [{}] {}  —  {}  —  {pci} ({})", g.index, g.name, g.uuid.as_deref().unwrap_or("N/A"), g.identity_evidence.unwrap_or("identity unavailable"));
     }
 }
 
@@ -419,14 +420,9 @@ fn cmd_profile(a: &Args, cfg: &Config) {
         Some("apply") => {
             let n = need("apply");
             require_root();
-            let out = apply_profile(a.gpu(), n, cfg).unwrap_or_else(|e| die(1, format!("Profile '{n}': {e}")));
-            for w in &out.warnings { eprintln!("  warning: {w}"); }
-            if !out.errors.is_empty() {
-                for e in &out.errors { eprintln!("  error: {e}"); }
-                die(1, format!("Profile '{n}' applied with errors."));
-            }
-            if out.warnings.is_empty() { println!("Applied profile '{n}'."); }
-            else { println!("Applied profile '{n}' with warnings (see stderr)."); }
+            let msg = ops::apply_profile_verified(a.gpu(), n, cfg, 1)
+                .unwrap_or_else(|e| die(1, format!("Profile '{n}': {e}")));
+            println!("{msg}");
         }
         _ => die(2, "usage: nvcurve profile list|save NAME|apply NAME|default (NAME|--clear)"),
     }
@@ -540,6 +536,86 @@ fn cmd_reset_all(a: &Args) {
     if !errs.is_empty() { exit(1); }
 }
 
+/// Mirror the root helper's plausible field bounds without replacing its
+/// authoritative root-owned configuration and validation on Apply.
+fn validate_draft_fields(draft: &Map<String, Value>, max_delta: i64) -> Result<(), String> {
+    const BOUNDS: &[(&str, i64, i64)] = &[
+        ("mem_offset_mhz", -10_000, 10_000), ("power_limit_w", 1, 1_000),
+        ("mem_locked_min_mhz", 1, nvcurve::safety::MAX_MEM_CLOCK_MHZ),
+        ("mem_locked_max_mhz", 1, nvcurve::safety::MAX_MEM_CLOCK_MHZ),
+        ("gpu_clock_cap_mhz", 210, 4_000), ("gpu_clock_comp_mhz", 0, nvcurve::safety::MAX_CLOCK_COMP_MHZ),
+        ("flatten_from", 0, CT_POINTS as i64 - 1), ("flatten_mhz", 1, 10_000),
+    ];
+    for (key, value) in draft {
+        match key.as_str() {
+            "name" => if !value.as_str().is_some_and(nvcurve::profiles::native::is_canonical_profile_name) { return Err("invalid draft name".into()); },
+            "gpu_name" => if !value.is_null() && !value.as_str().is_some_and(|s| s.len() <= 256) { return Err("invalid GPU name".into()); },
+            "curve_deltas" => {
+                if value.is_null() { continue; }
+                let deltas = value.as_object().ok_or("invalid curve deltas")?;
+                let up = max_delta.min(MAX_DELTA_KHZ);
+                if deltas.len() > CT_POINTS || deltas.iter().any(|(k, v)|
+                    !k.parse::<usize>().is_ok_and(|i| i < CT_POINTS && i.to_string() == *k) ||
+                    !v.as_i64().is_some_and(|d| (MIN_DELTA_KHZ..=up).contains(&d))) {
+                    return Err("invalid draft curve delta index or value".into());
+                }
+            },
+            _ => match BOUNDS.iter().find(|b| b.0 == key.as_str()) {
+                Some(&(_, lo, hi)) if value.is_null() || value.as_i64().is_some_and(|n| (lo..=hi).contains(&n)) => {},
+                _ => return Err(format!("unknown or invalid draft field {key}")),
+            }
+        }
+    }
+    if let (Some(lo), Some(hi)) = (draft.get("mem_locked_min_mhz").and_then(Value::as_i64), draft.get("mem_locked_max_mhz").and_then(Value::as_i64)) {
+        if lo > hi { return Err("VRAM lock minimum exceeds maximum".into()); }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod draft_tests {
+    use super::*;
+    #[test]
+    fn read_only_draft_schema_rejects_bad_values_before_gpu_access() {
+        for bad in [json!({"name":"_live","curve_deltas":{"01":0}}),
+            json!({"name":"_live","curve_deltas":{"1":900000}}),
+            json!({"name":"_live","curve_deltas":{"1":true}}),
+            json!({"name":"_live","mem_locked_min_mhz":2000,"mem_locked_max_mhz":1000}),
+            json!({"name":"_live","gpu_clock_cap_mhz":99999}),
+            json!({"name":"_live","unknown":null})] {
+            assert!(validate_draft_fields(bad.as_object().unwrap(), 200000).is_err());
+        }
+        let good = json!({"name":"_live","curve_deltas":{"1":-15000},"gpu_clock_cap_mhz":null});
+        assert!(validate_draft_fields(good.as_object().unwrap(), 200000).is_ok());
+    }
+}
+
+/// Explicit user-requested validation. Never calls require_root or writes a
+/// profile, snapshot, journal or GPU setting. It can read/wake the chosen GPU.
+fn cmd_validate_draft(a: &Args, cfg: &Config) {
+    use std::io::Read;
+    let mut invalid_points = Vec::new();
+    let result = (|| -> Result<Value, String> {
+        let mut input = Vec::new();
+        std::io::stdin().lock().take(256 * 1024 + 1).read_to_end(&mut input).map_err(|e| e.to_string())?;
+        if input.len() > 256 * 1024 { return Err("draft request too large".into()); }
+        let request: Value = serde_json::from_slice(&input).map_err(|e| e.to_string())?;
+        let expected_gpu = request["expected_gpu"].as_str().filter(|s| !s.is_empty() && s.len() <= 256).ok_or("missing expected GPU name")?;
+        let points = request["expected_points"].as_array().filter(|p| !p.is_empty() && p.len() <= CT_POINTS).ok_or("missing expected point layout")?;
+        if points.iter().any(|p| !p.as_array().is_some_and(|p| p.len() == 2 && p[0].as_u64().is_some_and(|i| i < CT_POINTS as u64) && p[1].as_u64().is_some_and(|v| v <= 10_000_000))) {
+            return Err("invalid expected point layout".into());
+        }
+        let draft = request["profile_data"].as_object().ok_or("missing profile data")?;
+        validate_draft_fields(draft, cfg.max_delta_khz)?;
+        let p = ProfileData::from_value(Value::Object(draft.clone()), "draft")?;
+        nvcurve::profiles::apply::validate_profile_draft(a.gpu(), &p, cfg, expected_gpu, &request["expected_points"], &request["expected_device"], &mut invalid_points)
+    })();
+    match result {
+        Ok(v) => println!("{}", json!({"ok": true, "validation": v})),
+        Err(e) => { println!("{}", json!({"ok": false, "error": e, "invalid_points": invalid_points})); exit(1); }
+    }
+}
+
 fn main() {
     let a = parse_args();
     let default_level = if a.pos.first().map(String::as_str) == Some("autoload") { log::Level::Info } else { log::Level::Warn };
@@ -550,11 +626,13 @@ fn main() {
     let writes = matches!((c0, c1), (Some("write" | "reset-all" | "autoload"), _)
         | (Some("snapshot"), Some("restore")) | (Some("profile"), Some("apply"))
         | (Some("memlock"), Some("set" | "reset")) | (Some("powermizer"), Some("set")));
-    let _lock = (writes && !a.flag("--dry-run") && unsafe { libc::geteuid() } == 0)
+    let sensor_probe = c0 == Some("sensors");
+    let _lock = ((writes || sensor_probe) && !a.flag("--dry-run") && unsafe { libc::geteuid() } == 0)
         .then(|| ops::gpu_write_lock().unwrap_or_else(|e| die(1, format!("nvcurve: {e}"))));
     match a.pos.first().map(String::as_str) {
         Some("read") => cmd_read(&a),
         Some("inspect") => cmd_inspect(&a),
+        Some("validate-draft") => cmd_validate_draft(&a, &cfg),
         Some("write") => cmd_write(&a, &cfg),
         Some("snapshot") => cmd_snapshot(&a, &cfg),
         Some("gpus") => cmd_gpus(),

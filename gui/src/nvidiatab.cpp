@@ -7,6 +7,14 @@
 #include "theme.h"
 #include "vfcurvewidget.h"
 #include <QToolButton>
+#include <QFileInfo>
+#include <QStandardPaths>
+
+/// This project's own CLI (installed beside the helpers); the PATH one may belong to another install.
+static QString ownCli() {
+    const QString own = privileged::helperPath(QStringLiteral("nvcurve"));
+    return QFileInfo(own).isExecutable() ? own : QStandardPaths::findExecutable(QStringLiteral("nvcurve"));
+}
 
 /// Kernel boot id: ties a recorded curve transaction to the boot it ran in.
 static QString bootId() {
@@ -1250,7 +1258,7 @@ void NvidiaTab::validateDraft() {
     const auto ids = pointIds_; const auto volts = pointVoltages_; const auto gpu = readGpuName_; const auto device = readGpuDevice_;
     vf_->setInvalidPoints({});
     setBusy(true);
-    userhelper::runProgram(QStandardPaths::findExecutable(QStringLiteral("nvcurve")), {QStringLiteral("validate-draft")},
+    userhelper::runProgram(ownCli(), {QStringLiteral("validate-draft")},
         {{"profile_data", data}, {"expected_gpu", gpu}, {"expected_points", expectedPoints}, {"expected_device",device}}, this,
         [this, data, ids, volts, gpu, device](const QJsonObject &reply) {
             setBusy(false);

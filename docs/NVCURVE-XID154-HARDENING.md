@@ -23,7 +23,7 @@ The changes in this branch target **mixed GPU state / repeated writes / unsynchr
 
 ## Safe Gentoo/OpenRC validation
 
-1. Disable boot application during evaluation: `sudo rc-update del nvcurve-autoload default` (and `sudo rc-service nvcurve-autoload stop` if running).
+1. Disable boot application during evaluation: `sudo rc-update del nvcurve-gui-autoload default` (and `sudo rc-service nvcurve-gui-autoload stop` if running).
 2. Build on your Gentoo machine using the project's ordinary installation/build workflow. Before enabling autoload, run `cargo test -p nvcurve` and `cargo test --workspace --locked`; then build the Qt GUI via the documented CMake/Qt6 dependencies.
 3. Keep the private register probe opt-in **unset**. Verify `nvcurve read --json` and `nvcurve sensors --json` are read-only. Observe the GPU at stock settings over multiple clean boots.
 4. With an idle GPU and after saving a rollback snapshot, apply a **conservative known-stable profile manually**, once. Read back the V/F table and check kernel logs. A hard failure or `Xid 154` means stop; **do not repeatedly retry** the same profile in the same boot.

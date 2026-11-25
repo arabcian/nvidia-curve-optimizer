@@ -3,10 +3,10 @@
 # Set from the GUI's ★ Default button (/etc/nvcurve/config.json).
 
 description="Apply the nvcurve auto-load GPU profile"
-command="@BINDIR@/nvcurve"
+command="@LIBEXEC@/nvcurve"
 
 depend() {
-	need localmount nvcurve-boot-guard
+	need localmount nvcurve-gui-boot-guard
 	after modules udev nvidia-persistenced
 }
 

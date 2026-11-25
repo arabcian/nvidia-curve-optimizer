@@ -1,12 +1,12 @@
-# nvcurve boot guard (systemd). Pulled in by nvcurve-autoload.service.
+# nvcurve boot guard (systemd). Pulled in by nvcurve-gui-autoload.service. Named apart from Centurion's units so both can be installed.
 # Arms at boot, disarms after 3 minutes of stable uptime or on a clean
-# shutdown; a boot that dies armed pauses nvcurve-autoload (ExecCondition)
+# shutdown; a boot that dies armed pauses nvcurve-gui-autoload (ExecCondition)
 # until it is resumed with `sudo nvcurve-boot-guard reset`.
 
 [Unit]
 Description=nvcurve boot guard
 After=local-fs.target systemd-tmpfiles-setup.service
-Before=nvcurve-autoload.service
+Before=nvcurve-gui-autoload.service
 
 [Service]
 Type=simple

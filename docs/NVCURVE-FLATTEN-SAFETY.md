@@ -37,7 +37,7 @@ The Python tests are source-level checks, not a Rust parser or GPU simulation. A
 To isolate the startup fault, disable boot autoload before deploying the test build (do not re-enable until you have established stability):
 
 ```bash
-sudo rc-update del nvcurve-autoload default
+sudo rc-update del nvcurve-gui-autoload default
 ```
 
 Check `dmesg` for NVRM/Xid and UVM faults after each controlled boot. Do not repeatedly reapply a profile to a GPU in Xid 154 recovery state. The particular `EXPERIMENTAL` profile with +240 MHz below the index-72 flatten and a 2692 MHz flat top may be *rejected* if the actual driver V/F anchor is higher than the plateau; this is an intentional safety failure, not a compatibility bug.

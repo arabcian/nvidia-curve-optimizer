@@ -81,7 +81,7 @@ doğrulanmıştır.
 
 Aşırı agresif bir eğri her açılışta uygulanıp makineyi çökerten bir döngüye girebilir.
 Guard her açılışta "armed" olur; 180 sn kararlı çalışma veya temiz kapanışta "disarm"
-olur. Silahlıyken ölen bir önceki açılış tespit edilirse `nvcurve-autoload` **atlanır**
+olur. Silahlıyken ölen bir önceki açılış tespit edilirse `nvcurve-gui-autoload` **atlanır**
 (`ExecCondition` / OpenRC `start`) ve kullanıcı `nvcurve-boot-guard reset` diyene kadar
 atlanmaya devam eder — otomatik geri açılmaz, çökme/atlama/çökme döngüsü olmaz.
 Durum `/var/lib/nvcurve/boot-guard.json`: root sahipli dizin, `O_NOFOLLOW` ile açılan ve

@@ -21,18 +21,35 @@ fi
 
 # Boot services first: a still-enabled unit would point at binaries that are gone.
 if [[ -d /run/systemd/system ]]; then
-    systemctl disable --now nvcurve-autoload.service nvcurve-boot-guard.service >/dev/null 2>&1 || true
+    systemctl disable --now nvcurve-gui-autoload.service nvcurve-gui-boot-guard.service >/dev/null 2>&1 || true
 elif command -v rc-update >/dev/null 2>&1; then
-    for s in nvcurve-autoload nvcurve-boot-guard; do
+    for s in nvcurve-gui-autoload nvcurve-gui-boot-guard; do
         rc-service "$s" --ifstarted stop >/dev/null 2>&1 || true
         for rl in /etc/runlevels/*/; do rc-update del "$s" "$(basename "$rl")" >/dev/null 2>&1 || true; done
     done
 fi
-rm -f /etc/init.d/nvcurve-autoload /etc/init.d/nvcurve-boot-guard \
-      "$UNITDIR/nvcurve-autoload.service" "$UNITDIR/nvcurve-boot-guard.service" && ok "Removed boot services (if present)"
+rm -f /etc/init.d/nvcurve-gui-autoload /etc/init.d/nvcurve-gui-boot-guard \
+      "$UNITDIR/nvcurve-gui-autoload.service" "$UNITDIR/nvcurve-gui-boot-guard.service" && ok "Removed boot services (if present)"
+# Services installed under the old names (nvcurve-autoload / nvcurve-boot-guard) are removed only when they
+# point into this project's LIBEXEC: the same names belong to Centurion, which this must not touch.
+for old in nvcurve-autoload nvcurve-boot-guard; do
+    for f in "$UNITDIR/$old.service" "/etc/init.d/$old"; do
+        if [[ -f $f ]] && grep -qF "$LIBEXEC/" "$f"; then
+            [[ -d /run/systemd/system ]] && systemctl disable --now "$old.service" >/dev/null 2>&1 || true
+            rm -f "$f" && ok "Removed old-named service $f"
+        fi
+    done
+done
 
 rm -rf "$LIBEXEC" && ok "Removed $LIBEXEC"
-rm -f "$PREFIX/bin/nvcurve-gui" "$PREFIX/bin/nvcurve" && ok "Removed $PREFIX/bin/nvcurve-gui and nvcurve"
+rm -f "$PREFIX/bin/nvcurve-gui" && ok "Removed $PREFIX/bin/nvcurve-gui"
+# The CLI link / old copy only when it is this project's (Centurion's /usr/bin/nvcurve is never touched).
+if [[ -L $PREFIX/bin/nvcurve && $(readlink "$PREFIX/bin/nvcurve") == "$LIBEXEC/nvcurve" ]] \
+   || [[ -f $PREFIX/bin/nvcurve && ! -L $PREFIX/bin/nvcurve && $PREFIX == /usr/local ]]; then
+    rm -f "$PREFIX/bin/nvcurve" && ok "Removed $PREFIX/bin/nvcurve"
+else
+    echo "Left $PREFIX/bin/nvcurve alone (not this project's)."
+fi
 rm -f "$POLKIT_ACTIONS_DIR/com.nvcurve.gui.policy" && ok "Removed polkit action"
 rm -f "$POLKIT_RULES_DIR/49-nvcurve-gui.rules" && ok "Removed polkit rules (if present)"
 rm -f "$PREFIX/share/applications/nvcurve-gui.desktop" "$PREFIX/share/icons/hicolor/scalable/apps/nvcurve-gui.svg" \
@@ -47,7 +64,14 @@ elif command -v rc-service >/dev/null 2>&1 && [[ -d /run/openrc ]]; then
 fi
 
 echo
-read -r -p "Also remove saved V/F profiles, config and guard state (/etc/nvcurve, /var/lib/nvcurve, /var/cache/nvcurve)? [y/N] " REPLY || REPLY=""
+# /etc/nvcurve (profiles + config.json) is shared with Centurion, which reads the same files: never
+# offered for removal while Centurion is installed.
+REPLY=""
+if [[ -d /usr/libexec/centurion || -d /usr/local/libexec/centurion || -d /etc/centurion ]]; then
+    echo "Centurion is installed: /etc/nvcurve (shared profiles + config) is kept."
+else
+    read -r -p "Also remove saved V/F profiles, config and guard state (/etc/nvcurve, /var/lib/nvcurve, /var/cache/nvcurve)? [y/N] " REPLY || REPLY=""
+fi
 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
     rm -rf /etc/nvcurve /var/lib/nvcurve /var/cache/nvcurve
     ok "Removed /etc/nvcurve, /var/lib/nvcurve, /var/cache/nvcurve"

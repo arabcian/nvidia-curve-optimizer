@@ -49,7 +49,7 @@ Below it, the profile row:
   it does **not** apply them. The default profile is marked with ★.
 - **Apply Profile** — apply the selected saved profile to the GPU as it is.
 - **★ Default** — toggles whether the selected profile is the boot-time
-  auto-load profile (used by `nvcurve autoload` / the `nvcurve-autoload` service).
+  auto-load profile (used by `nvcurve autoload` / the `nvcurve-gui-autoload` service).
 - **Delete** — delete the selected profile (and clear the default if it was one).
 
 ### V/F Curve
@@ -122,7 +122,7 @@ They are JSON files under `/etc/nvcurve/profiles/`; names are letters, digits, s
 2. **Apply Offsets**, with **Trial apply** ticked while testing, and confirm it behaves.
 3. **Save As…** with a name (`quiet`, `max-perf`, `undervolt`).
 4. Optionally mark it **★ Default** and enable the boot service
-   (`systemctl enable nvcurve-autoload.service`, or `rc-update add nvcurve-autoload default`).
+   (`systemctl enable nvcurve-gui-autoload.service`, or `rc-update add nvcurve-gui-autoload default`).
    The boot guard pauses the autoload after a boot that died right after applying it;
    resume it with `sudo nvcurve-boot-guard reset` (installed under the libexec directory,
    `/usr/local/libexec/nvcurve-gui/` by default).

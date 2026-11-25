@@ -57,7 +57,7 @@ nvidia-curve-optimizer/
 │   └── data/                  #   theme glyphs, app icon (SVG)
 ├── crates/nvcurve/            # Rust core: NvAPI/NVML (dlopen) HAL, safety limits, profiles, root helpers
 │   └── src/bin/               #   nvcurve (CLI)  nvcurve-root-helper  nvcurve-sensors  nvcurve-boot-guard
-├── packaging/                 # systemd units + OpenRC scripts (nvcurve-autoload, nvcurve-boot-guard)
+├── packaging/                 # systemd units + OpenRC scripts (nvcurve-gui-autoload, nvcurve-gui-boot-guard)
 ├── com.nvcurve.gui.policy     # polkit actions (pinned to the helpers)
 ├── 49-nvcurve-gui.rules       # polkit rules: allowlist + security level 1/2
 ├── nvcurve-gui.desktop        # application launcher
@@ -99,7 +99,7 @@ nvidia-curve-optimizer/
   `allow_active=yes`).
 - `nvcurve` (CLI) is the same core without the GUI: `nvcurve read`, `profile
   apply NAME`, `autoload`, … Run `nvcurve` without arguments for the list.
-- Boot-time profile (optional): `nvcurve-autoload` applies the profile marked
+- Boot-time profile (optional): `nvcurve-gui-autoload` applies the profile marked
   ★ Default. `nvcurve-boot-guard` arms at boot and disarms after 3 minutes of
   stable uptime; a boot that dies in between pauses the autoload until
   `nvcurve-boot-guard reset`, so a too-aggressive curve cannot crash-loop the

@@ -20,9 +20,11 @@ Type=oneshot
 RemainAfterExit=yes
 Environment=NVCURVE_LOG=info
 ExecStart=@LIBEXEC@/nvcurve autoload
-# The nvidia module / device nodes can appear after this unit on some boots.
+# The nvidia module / device nodes can appear after this unit on some boots: a failure BEFORE any GPU
+# write is retried. A failed write (exit 70) is never repeated, here or by the boot guard's check.
 Restart=on-failure
 RestartSec=3
+RestartPreventExitStatus=70
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateNetwork=yes

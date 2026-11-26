@@ -69,7 +69,26 @@ pub fn should_skip() -> Option<String> {
     if previous_boot_died(&v, &boot_id()) {
         return Some("the previous boot did not stay up after the presets were applied".into());
     }
+    if write_failed_this_boot(&v, &boot_id()) {
+        return Some(v["write_failed_reason"].as_str().unwrap_or("a GPU write of the boot-time profile failed").to_owned()
+            + " — no further GPU writes this boot (reboot, or `nvcurve-boot-guard reset`)");
+    }
     None
+}
+
+/// A GPU write of this boot's autoload already failed: nothing writes to the GPU again until the next boot.
+fn write_failed_this_boot(v: &Value, current: &str) -> bool {
+    !current.is_empty() && v["write_failed_boot"].as_str() == Some(current)
+}
+
+/// Records a failed GPU write for this boot (autoload quarantine, see `should_skip`).
+pub fn note_write_failure(reason: &str) -> Result<(), String> {
+    let cur = boot_id();
+    if cur.is_empty() { return Err("no boot_id".into()); }
+    let mut v = read();
+    v["write_failed_boot"] = json!(cur);
+    v["write_failed_reason"] = json!(reason);
+    write(&v)
 }
 
 fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
@@ -124,6 +143,8 @@ pub fn reset() -> Result<Value, String> {
     v["tripped"] = json!(false);
     v["reason"] = Value::Null;
     v["tripped_at"] = Value::Null;
+    v["write_failed_boot"] = Value::Null;
+    v["write_failed_reason"] = Value::Null;
     if v["state"] == "paused" { v["state"] = json!("ok"); }
     if v["boot_id"].is_null() { v["boot_id"] = json!(boot_id()); }
     write(&v)?;
@@ -139,5 +160,12 @@ mod tests {
         assert!(!previous_boot_died(&json!({"state": "armed", "boot_id": "b"}), "b"));  // same boot, still in window
         assert!(!previous_boot_died(&json!({"state": "ok", "boot_id": "a"}), "b"));
         assert!(!previous_boot_died(&json!({}), "b"));
+    }
+    #[test]
+    fn a_failed_write_quarantines_only_its_own_boot() {
+        assert!(write_failed_this_boot(&json!({"write_failed_boot": "b"}), "b"));
+        assert!(!write_failed_this_boot(&json!({"write_failed_boot": "a"}), "b"));  // an earlier boot
+        assert!(!write_failed_this_boot(&json!({"write_failed_boot": null}), "b"));  // cleared by reset
+        assert!(!write_failed_this_boot(&json!({"write_failed_boot": ""}), ""));     // no boot id: never matches
     }
 }

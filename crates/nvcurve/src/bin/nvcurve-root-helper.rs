@@ -220,7 +220,11 @@ fn op_apply_named_profile(p: &Obj) -> OpResult {
 }
 
 fn op_reset_gpu_curve(p: &Obj) -> OpResult {
-    let msg = ops::reset_gpu_curve_verified(gpu_param(p)?)?;
+    // The GUI's trial timer ends a trial with origin "trial": that one also undoes the VRAM offset,
+    // VRAM lock and power limit the trial's profile set, not only the curve and core cap.
+    let gpu = gpu_param(p)?;
+    let msg = if p.get("origin").and_then(Value::as_str) == Some("trial") { ops::reset_trial_verified(gpu)? }
+              else { ops::reset_gpu_curve_verified(gpu)? };
     refresh_result(RESET_RESULT, p);
     Ok(msg)
 }
